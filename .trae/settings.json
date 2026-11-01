@@ -1,0 +1,30 @@
+{
+    // ═══════════════════════════════════════════════════════════
+    //  clangd  (sobrescribe el global para este proyecto)
+    // ═══════════════════════════════════════════════════════════
+    "clangd.arguments": [
+        "--compile-commands-dir=${workspaceFolder}/build",
+        "--background-index",
+        "--clang-tidy",
+        "--header-insertion=iwyu",
+        "--query-driver=**"
+    ],
+
+    // ═══════════════════════════════════════════════════════════
+    //  Rendimiento específico del proyecto
+    // ═══════════════════════════════════════════════════════════
+    "search.exclude": {
+        "**/.pixi": true,
+        "**/.venv": true,
+        "**/build": true,
+        "**/.trae/backups": true,
+        "**/__mojocache__": true
+    },
+    "files.watcherExclude": {
+        "**/.pixi/**": true,
+        "**/.venv/**": true,
+        "**/build/**": true,
+        "**/.trae/backups/**": true,
+        "**/__mojocache__/**": true
+    }
+}
