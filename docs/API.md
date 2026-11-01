@@ -125,10 +125,25 @@ ChronosRT_status_t ChronosRT_benchmark_run(ChronosRT_handle_t handle,
                                            ChronosRT_benchmark_mode_t mode,
                                            uint32_t duration_sec,
                                            ChronosRT_metrics_t* metrics);
+
+/* Variante con control del número de hilos (throughput/estrés). */
+ChronosRT_status_t ChronosRT_benchmark_run_ex(ChronosRT_handle_t handle,
+                                              ChronosRT_benchmark_mode_t mode,
+                                              uint32_t duration_sec,
+                                              uint32_t threads,
+                                              ChronosRT_metrics_t* metrics);
+
 ChronosRT_status_t ChronosRT_metrics_report(const ChronosRT_metrics_t* metrics);
 ```
 
 Modos: `ChronosRT_MODE_LATENCY`, `_THROUGHPUT`, `_JITTER`, `_STRESS`, `_WCET`.
+En `_THROUGHPUT` los hilos se reparten en productores y consumidores; con
+`threads = 16` se usan 8 productores y 8 consumidores.
+
+Antes de medir, cada hilo se eleva a `SCHED_FIFO` prioridad 80, se fija a una CPU
+distinta del conjunto permitido y ejecuta 20 000 iteraciones de calentamiento.
+Si hay más hilos que CPUs disponibles, la elevación se omite para evitar que un
+productor que nunca se bloquea hambriente al consumidor.
 
 ```c
 typedef struct ChronosRT_CACHE_ALIGNED {
@@ -144,6 +159,12 @@ typedef struct ChronosRT_CACHE_ALIGNED {
     uint64_t memory_bandwidth_mbps;
     uint64_t wcet_ns;
     uint64_t best_case_ns;
+    /* Percentiles de la ventana medida (0 si el modo no los calcula). */
+    uint64_t p50_ns;
+    uint64_t p99_ns;
+    uint64_t p999_ns;
+    /* Muestras que superan CHRONOSRT_LATENCY_TARGET_NS (10 µs). */
+    uint64_t latency_spikes;
 } ChronosRT_metrics_t;
 ```
 

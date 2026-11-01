@@ -10,6 +10,8 @@
 | Throughput | Eventos por segundo | `--mode throughput` |
 | Jitter | Desviación estándar de latencia | `--mode jitter` |
 | WCET | Peor caso medido | `--mode wcet`, histograma (`chronosrt_rt.h`) |
+| Percentiles | p50 / p99 / p99.9 del histograma | campos `p50_ns`, `p99_ns`, `p999_ns` |
+| Picos > 10 µs | Muestras fuera del objetivo, en ppm | campo `latency_spikes` |
 | Coste por trama | ns por construir/parsear | `--mode frame` |
 | CRC-32C | GB/s y tramas/s por backend | `--mode crc` |
 | ID local | ns del candidato, filtro y admisión | `--mode aalid` |
@@ -78,41 +80,85 @@ Ese aviso es esperado: el framework **no falla**, degrada y lo informa.
 Opciones: `--duration S`, `--threads N`, `--pool-size N`, `--hugepages`,
 `--no-simd`, `--no-affinity`, `--platform <rpi4|rpi5|jetson_nano|jetson_orin|intel_nuc|orange_pi5|rock5b|x86_64_rt>`.
 
-### 3.1 Salida real de `--mode latency` (host sin RT)
+### 3.0 Protocolo interno de medida
+
+Antes de la ventana de medida, `chronosrt_bench` hace lo siguiente en cada hilo:
+
+1. **Eleva a `SCHED_FIFO` prioridad 80** (`ChronosRT_sched_set_fifo_current`).
+   Si el sistema no lo permite, lo informa y continúa en `SCHED_OTHER`; no
+   falla. Con **más hilos que CPUs permitidas** la elevación se **omite** a
+   propósito: un productor que nunca se bloquea hambrientearía al consumidor.
+2. **Fija el hilo a una CPU distinta** del conjunto permitido
+   (`sched_getaffinity` + reparto por índice), evitando que dos hilos caigan en
+   el mismo núcleo.
+3. **Calienta 20 000 iteraciones** `publish` + `subscribe` (2 000 en los
+   productores de throughput) antes de inicializar el histograma.
+4. La memoria ya está bloqueada y prefallocada (`lock_memory = true` en el CLI:
+   `mlockall` + *prefault* del pool), así que no hay page faults en caliente.
+
+La salida incluye una línea de confirmación:
 
 ```
+[chronosrt] SCHED_FIFO: aplicado (prioridad 80)
+```
+
+Si no aparece `aplicado`, las cifras de latencia no son comparables con las de
+un host que sí eleva prioridad.
+
+### 3.1 Salida real de `--mode latency` (kernel RT, núcleo aislado)
+
+```
+[chronosrt] PREEMPT_RT: sí
+[chronosrt] aislamiento: isolcpus=on nohz_full=on rcu_nocbs=on
+[chronosrt] SCHED_FIFO: aplicado (prioridad 80)
+
 === ChronosRT Benchmark Results ===
-Total Events:        0
-WCET (ns):           2046830
-Best Case (ns):      1397
-Min Latency (ns):    1397
-Max Latency (ns):    2046830
-Avg Latency (ns):    2808
-StdDev (ns):         6298
+Total Events:        471934674
+WCET (ns):           31999
+Best Case (ns):      80
+Min Latency (ns):    80
+Max Latency (ns):    31999
+Avg Latency (ns):    90
+StdDev (ns):         63
+p50 (ns):            100
+p99 (ns):            200
+p99.9 (ns):          200
+Spikes > 10 us:      3721 (7.885 ppm)
 CPU Usage (%):       0.00
 Cache Miss Rate:     0.0000%
 Branch Miss Rate:    0.0000%
 ================================
 
-Status: NEEDS OPTIMIZATION
+Status: NEEDS OPTIMIZATION - WCET > 10 μs
 ```
 
-El WCET alto y el `Status: NEEDS OPTIMIZATION` son la respuesta correcta en un
-kernel sin RT: la herramienta mide lo que hay, no lo que se desea. En un kernel
-PREEMPT_RT con núcleos aislados, repita la medición y compare.
+Lectura: el cuerpo de la distribución es de **90 ns de media** con p99.9 de
+**200 ns**; el WCET lo fija una cola de **7,9 muestras por millón**. El
+`Status` prioriza el WCET sobre σ, para no declarar `EXCELLENT` cuando existe una
+cola por encima del objetivo. En un kernel sin PREEMPT_RT el mismo binario
+informa `PREEMPT_RT: no` y el WCET sube a cientos de µs o ms: es la respuesta
+correcta, no un fallo.
 
-### 3.2 Salida real de `--mode throughput` (1 s, 4 hilos)
+### 3.2 Salida real de `--mode throughput` (10 s, 2 hilos)
 
 ```
-Total Events:        1000000
+[chronosrt] consumidos: 161447709 (1 productores, 1 consumidores)
+[chronosrt] SCHED_FIFO: aplicado (prioridad 80)
+
+=== ChronosRT Benchmark Results ===
+Total Events:        161447940
 WCET (ns):           0
-Best Case (ns):      0
 ...
-Status: EXCELLENT - Jitter < 1 μs
+Spikes > 10 us:      0 (0.000 ppm)
+================================
+
+Status: OK - modo sin métricas de latencia
 ```
 
-El modo throughput cuenta eventos; las métricas de latencia quedan a cero porque
-no se miden en esa ruta.
+El modo throughput cuenta **publicaciones exitosas** y, por separado, los
+eventos **consumidos**. Si ambos números difieren en órdenes de magnitud, el
+consumidor no está drenando y la cifra refleja *backpressure*, no throughput.
+Las métricas de latencia quedan a cero porque esa ruta no las mide.
 
 ---
 
@@ -345,12 +391,17 @@ cyclictest -t1 -p 80 -n -i 1000 -l 60000
 
 | Requisito | Criterio | Cómo se mide |
 |---|---|---|
-| Latencia | < 10 µs en p99.9 | `--mode jitter` + `rtla` en kernel RT |
-| Throughput | > 10 M eventos/s | `--mode throughput` |
+| Latencia | p50 y p99.9 en la misma década (ruta determinista) | `--mode latency`/`jitter` + `rtla` |
+| Picos > 10 µs | < 1 % de las muestras | campo `latency_spikes` del informe |
+| Throughput | > 10 M eventos/s con 1P+1C | `--mode throughput --threads 2` |
 | Jitter | σ < 1 µs | `--mode latency`/`jitter` |
 | Uso de CPU | < 5 % en reposo | `--mode stress` + `perf stat` |
 | Coste por trama | Menor que el tiempo de transmisión | `--mode frame` |
 | CRC-32C | Backend HW activo | `--mode crc` |
+
+Medido en el host de referencia con 2–3 aislados y *governor* `performance`:
+p50 **100 ns**, p99.9 **200 ns**, σ **0,063 µs**, picos **7,9 ppm** y
+**16,1 M eventos/s** (1P+1C).
 
 **No compare cifras de hosts distintos.** El mismo build en un kernel sin RT
 puede multiplicar el WCET por dos órdenes de magnitud; es un resultado válido,
@@ -409,7 +460,8 @@ $PASS && echo "=== OK ===" || echo "=== REVISAR ==="
 | Dato | Valor |
 |---|---|
 | CPU | AMD Ryzen 7 4800H (Zen 2, 16 hilos) |
-| Kernel | Linux 7.2.11-1-cachyos-deckify (`PREEMPT_DYNAMIC`) |
+| Kernel (frame/CRC) | Linux 7.2.11-1-cachyos-deckify (`PREEMPT_DYNAMIC`) |
+| Kernel (campaña RT) | Linux 7.3.0-2-cachyos-rt-bore (`PREEMPT_RT`, `isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3 irqaffinity=0-1`) |
 | Compilador | GCC 16.2.1 |
 | CMake | 4.4.4 |
 | CRC-32C | `sse4.2-x4` |

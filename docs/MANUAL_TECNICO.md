@@ -1919,6 +1919,10 @@ typedef struct ChronosRT_CACHE_ALIGNED {
     uint64_t memory_bandwidth_mbps;  // Ancho de banda memoria MB/s
     uint64_t wcet_ns;                // Worst-Case Execution Time
     uint64_t best_case_ns;           // Best-Case Execution Time
+    uint64_t p50_ns;                 // Percentil 50 (0 si el modo no lo calcula)
+    uint64_t p99_ns;                 // Percentil 99
+    uint64_t p999_ns;                // Percentil 99,9
+    uint64_t latency_spikes;         // Muestras > CHRONOSRT_LATENCY_TARGET_NS
 } ChronosRT_metrics_t;
 ```
 
@@ -2100,29 +2104,36 @@ ChronosRT_status_t ChronosRT_metrics_report(
 );
 ```
 
-**Salida formateada (ejemplo real en host sin PREEMPT_RT):**
+**Salida formateada (ejemplo real en kernel RT con núcleos aislados):**
 ```
 === ChronosRT Benchmark Results ===
-Total Events:        0
-WCET (ns):           2046830
-Best Case (ns):      1397
-Min Latency (ns):    1397
-Max Latency (ns):    2046830
-Avg Latency (ns):    2808
-StdDev (ns):         6298
+Total Events:        471934674
+WCET (ns):           31999
+Best Case (ns):      80
+Min Latency (ns):    80
+Max Latency (ns):    31999
+Avg Latency (ns):    90
+StdDev (ns):         63
+p50 (ns):            100
+p99 (ns):            200
+p99.9 (ns):          200
+Spikes > 10 us:      3721 (7.885 ppm)
 CPU Usage (%):       0.00
 Cache Miss Rate:     0.0000%
 Branch Miss Rate:    0.0000%
 ================================
 
-Status: NEEDS OPTIMIZATION
+Status: NEEDS OPTIMIZATION - WCET > 10 μs
 ```
 
-Los valores dependen del host. En un kernel con PREEMPT_RT y núcleos aislados
-las cifras cambian; el estado `NEEDS OPTIMIZATION` en un kernel sin RT es un
-diagnóstico correcto, no un fallo de la biblioteca.
+Los valores dependen del host. Los percentiles y `latency_spikes` solo aparecen
+en los modos que miden latencia (`latency`, `jitter`, `wcet`); el histograma
+interno tiene 64 buckets de 100 ns, por lo que los percentiles se resuelven hasta
+6,4 µs y la cola se cuantifica con `latency_spikes` (muestras > 10 µs en ppm).
 
-**Criterios de estado:**
+**Criterios de estado (el WCET tiene prioridad):**
+- WCET > 10 µs → `NEEDS OPTIMIZATION - WCET > 10 μs`
+- sin métricas de latencia → `OK - modo sin métricas de latencia`
 - `EXCELLENT`: stddev < 1000 ns (1 μs)
 - `GOOD`: stddev < 5000 ns (5 μs)
 - `NEEDS OPTIMIZATION`: stddev >= 5000 ns

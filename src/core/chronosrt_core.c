@@ -359,23 +359,25 @@ ChronosRT_status_t ChronosRT_shutdown(ChronosRT_handle_t handle) {
 /* ------------------------------------------------------------------------ */
 
 static inline bool chronosrt_core_enqueue(ChronosRT_core_t* core, void* ptr) {
-    if (ChronosRT_ring_push(core->event_ring, ptr)) {
-        return true;
-    }
+    /* Con MPMC acotada se evita el ring SPSC, que no es seguro con varios
+     * productores. El ring queda como camino rápido del modo SPSC. */
     if (core->use_bounded) {
         return ChronosRT_bounded_push(&core->bounded, ptr);
+    }
+    if (ChronosRT_ring_push(core->event_ring, ptr)) {
+        return true;
     }
     return ChronosRT_mpmc_push(core->event_queue, ptr);
 }
 
 static inline void* chronosrt_core_dequeue(ChronosRT_core_t* core) {
-    void* ptr = ChronosRT_ring_pop(core->event_ring);
-    if (ptr) {
-        return ptr;
-    }
     if (core->use_bounded) {
         void* out = NULL;
         return ChronosRT_bounded_pop(&core->bounded, &out) ? out : NULL;
+    }
+    void* ptr = ChronosRT_ring_pop(core->event_ring);
+    if (ptr) {
+        return ptr;
     }
     return ChronosRT_mpmc_pop(core->event_queue);
 }

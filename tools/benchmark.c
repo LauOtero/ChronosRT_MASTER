@@ -398,6 +398,12 @@ int main(int argc, char* argv[]) {
     config.use_simd = true;
     config.use_cpu_affinity = true;
     config.use_numa_aware = true;
+    /* Páginas bloqueadas y prefallocadas: elimina los page faults del camino
+     * caliente, que son la causa típica de picos de decenas de µs. */
+    config.lock_memory = true;
+    /* El benchmark es multihilo: la cola SPSC no es segura con varios
+     * productores. Se usa la MPMC acotada (Vyukov). */
+    config.use_bounded_mpmc = true;
     config.platform = ChronosRT_detect_platform();
     
     static struct option long_options[] = {
@@ -475,6 +481,17 @@ int main(int argc, char* argv[]) {
 
     printf("Mode: %d\n", mode);
     printf("Duration: %us\n", duration);
+    /* Hilos efectivos: latencia/jitter/WCET usan uno; throughput exige 2. */
+    {
+        uint32_t effective = threads;
+        if (mode == ChronosRT_MODE_LATENCY || mode == ChronosRT_MODE_JITTER ||
+            mode == ChronosRT_MODE_WCET) {
+            effective = 1u;
+        } else if (mode == ChronosRT_MODE_THROUGHPUT && effective < 2u) {
+            effective = 2u;
+        }
+        printf("Threads: %u\n", effective);
+    }
     printf("SIMD: %s\n", config.use_simd ? "enabled" : "disabled");
     printf("CPU Affinity: %s\n", config.use_cpu_affinity ? "enabled" : "disabled");
     printf("Hugepages: %s\n", config.use_hugepages ? "enabled" : "disabled");
@@ -488,7 +505,7 @@ int main(int argc, char* argv[]) {
     }
     
     ChronosRT_metrics_t metrics;
-    status = ChronosRT_benchmark_run(handle, mode, duration, &metrics);
+    status = ChronosRT_benchmark_run_ex(handle, mode, duration, threads, &metrics);
     if (status != ChronosRT_SUCCESS) {
         fprintf(stderr, "Benchmark failed: %d\n", status);
         ChronosRT_shutdown(handle);

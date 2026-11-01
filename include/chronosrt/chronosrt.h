@@ -33,6 +33,10 @@ extern "C" {
 #define ChronosRT_MAX_EVENTS 1048576
 #define ChronosRT_CACHE_ALIGNED __attribute__((aligned(ChronosRT_CACHE_LINE)))
 
+/* Objetivo de latencia del proyecto: por encima de este umbral la muestra se
+ * contabiliza como pico (`latency_spikes`). */
+#define CHRONOSRT_LATENCY_TARGET_NS 10000ULL
+
 typedef enum {
     ChronosRT_SUCCESS = 0,
     ChronosRT_ERROR_INIT = -1,
@@ -91,6 +95,12 @@ typedef struct ChronosRT_CACHE_ALIGNED {
     uint64_t memory_bandwidth_mbps;
     uint64_t wcet_ns;
     uint64_t best_case_ns;
+    /* Percentiles de la ventana medida (0 si el modo no los calcula). */
+    uint64_t p50_ns;
+    uint64_t p99_ns;
+    uint64_t p999_ns;
+    /* Muestras que superan el objetivo de 10 µs (cola del histograma). */
+    uint64_t latency_spikes;
 } ChronosRT_metrics_t;
 
 typedef struct {
@@ -130,6 +140,7 @@ CHRONOSRT_API ChronosRT_status_t ChronosRT_event_publish(ChronosRT_handle_t hand
 CHRONOSRT_API ChronosRT_status_t ChronosRT_event_subscribe(ChronosRT_handle_t handle, ChronosRT_event_t* event, uint32_t timeout_us);
 
 CHRONOSRT_API ChronosRT_status_t ChronosRT_benchmark_run(ChronosRT_handle_t handle, ChronosRT_benchmark_mode_t mode, uint32_t duration_sec, ChronosRT_metrics_t* metrics);
+CHRONOSRT_API ChronosRT_status_t ChronosRT_benchmark_run_ex(ChronosRT_handle_t handle, ChronosRT_benchmark_mode_t mode, uint32_t duration_sec, uint32_t threads, ChronosRT_metrics_t* metrics);
 CHRONOSRT_API ChronosRT_status_t ChronosRT_metrics_report(const ChronosRT_metrics_t* metrics);
 
 CHRONOSRT_API uint64_t ChronosRT_get_cycles(void);

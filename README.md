@@ -25,7 +25,7 @@ hardware o el kernel no está preparado.
 - **EtherTux v0.1.0** (`AF_PACKET`, `0x88B5`): Ethernet comercial determinista.
 - **ID local determinista**: MAC LAA derivada del ID, filtro de recepción O(1) y
   admisión con autoridad central (sin *flooding* del switch).
-- **10 suites / 547 aserciones** · **320 símbolos `ChronosRT_*`** · build `Release` sin warnings.
+- **10 suites / 547 aserciones** · **321 símbolos `ChronosRT_*`** · build `Release` sin warnings.
 
 ---
 
@@ -82,21 +82,27 @@ hardware o el kernel no está preparado.
 ## Estado del proyecto
 
 Datos verificados en el host de referencia (**AMD Ryzen 7 4800H**, Linux
-`7.2.11`, GCC `16.2.1`, CMake `4.4.4`, build `Release`):
+`7.3.0-2-cachyos-rt-bore` con **PREEMPT_RT**, GCC `16.2.1`, CMake `4.4.4`,
+build `Release`, *governor* **`performance`**, **núcleos 2–3 aislados** con
+`isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3 irqaffinity=0-1`):
 
 | Comprobación | Resultado |
 | --- | --- |
 | Compilación | **0 errores, 0 warnings** |
 | `ctest` | **10/10 suites**, **547 aserciones** |
-| Símbolos exportados | **295 `ChronosRT_*`** con visibilidad controlada |
+| Símbolos exportados | **321 `ChronosRT_*`** con visibilidad controlada |
 | HAL detectada | `crc32c_backend = "sse4.2-x4"`, `fec_backend = "avx2"` |
-| Benchmark | `--mode frame` y `--mode crc` reproducible |
+| Benchmark | `--mode frame`, `crc`, `aalid`, `latency`, `jitter`, `wcet` y `throughput`; eleva a `SCHED_FIFO`, calienta y publica p50/p99/p99.9 + picos > 10 µs |
 | Versión / ABI | `0.1.0` / `0x000100` · SONAME `libchronosrt.so.0` |
 
 > Los objetivos de latencia (< 10 µs), jitter (σ < 1 µs) y throughput
-> (> 10 M eventos/s) dependen del kernel y del aislamiento de CPU. El proyecto
-> publica mediciones reales de coste de CPU y CRC; las cifras de red deben
-> validarse en cada plataforma con `chronosrt_bench`, `rtla` y `cyclictest`.
+> (> 10 M eventos/s) dependen del kernel y del aislamiento de CPU. En la campaña
+> con los núcleos **2–3 aislados** y *governor* `performance` sobre
+> `7.3.0-2-cachyos-rt-bore` se midieron **σ 0,063 µs**, **16,1 M eventos/s** y
+> picos de **27–39 µs** en 7–15 muestras por millón (detalle en
+> [Rendimiento medido](#rendimiento-medido)).
+> Las cifras de red deben validarse en cada plataforma con `chronosrt_bench`,
+> `rtla` y `cyclictest`.
 
 ---
 
@@ -110,22 +116,26 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 
-# Coste de CPU por trama y capacidad de la HAL
-./build/chronosrt_bench --mode frame
-./build/chronosrt_bench --mode crc --duration 1
+# Coste de CPU por trama y capacidad de la HAL (núcleo aislado 2)
+taskset -c 2 ./build/chronosrt_bench --mode frame
+taskset -c 2 ./build/chronosrt_bench --mode crc --duration 1
 ```
 
-Salida esperada (extracto real):
+Salida esperada (extracto real con `taskset -c 2` sobre `7.3.0-2-cachyos-rt-bore`):
 
 ```text
+[chronosrt] Kernel: 7.3.0 (7.3.0-2-cachyos-rt-bore)
+[chronosrt] PREEMPT_RT: sí
+[chronosrt] aislamiento: isolcpus=on nohz_full=on rcu_nocbs=on
+
 EtherCAT (datagrama de 10 B + datos):
-  construir datagrama (1024 B)   24.03 ns
-  parsear datagrama (1024 B)      3.68 ns
+  construir datagrama (1024 B)   23.61 ns
+  parsear datagrama (1024 B)      3.61 ns
 
 EtherTux v0.1.0 (cabecera de 26 B):
-  construir PDU (1464 B, con copia)   180.77 ns
-  construir cabecera (1464 B, sin copia) 140.77 ns
-  parsear + validar CRC (1464 B)     138.63 ns
+  construir PDU (1464 B, con copia)   177.12 ns
+  construir cabecera (1464 B, sin copia) 141.15 ns
+  parsear + validar CRC (1464 B)     133.56 ns
 ```
 
 Para compilar para una SBC concreta:
@@ -190,7 +200,7 @@ ChronosRT_MASTER/
 │   │   ├── chronosrt_protocol.c   # selección EtherCAT / EtherTux
 │   │   ├── ethercat/              # ec_frame/socket/master/slave/dc/mailbox
 │   │   └── ethertux/              # et_frame/fec/qos/sched/esm/sync/topology
-│   │                              # et_mbx/flowagg/frm/socket/master
+│   │                              # et_mbx/flowagg/frm/aalid/socket/master
 │   ├── integration/          # puente desacoplado con libtuxrt_core
 │   ├── simd/                 # hash, copia y batch vectorizados
 │   └── benchmark/            # motor de benchmarking
@@ -281,8 +291,10 @@ CRC-32C por instrucción y doce tipos de mensaje: `DATA`, `FEC`, `CONTROL`,
 Módulos: `et_frame` (serialización), `et_fec`, `et_qos`, `et_sched` (ventanas y
 ranuras), `et_esm` (ciclo de vida), `et_sync` (ET-Sync y monitor), `et_topology`
 (registro, ET-WKC, descubrimiento y Hot Connect), `et_mbx` (mailbox fiable),
-`et_flowagg` (agregación de flujos), `et_frm` (redundancia y deduplicación) y
-`et_master` (socket, envío, recepción y heartbeat).
+`et_flowagg` (agregación de flujos), `et_frm` (redundancia y deduplicación),
+`et_aalid` (ID local determinista: MAC LAA, candidato CRC-32C, backoff y
+admisión con autoridad central) y `et_master` (socket, envío, recepción y
+heartbeat).
 
 > La especificación §4.2 rotula la cabecera como "28 B", pero la suma de sus
 > campos es **26 B**; se implementa la tabla, que es la fuente de verdad (igual
@@ -311,24 +323,78 @@ interfaces, y `ChronosRT_ec_interface_index("enp2s0")` resuelve un nombre a
 
 ## Rendimiento medido
 
-Rutas puras de CPU **sin NIC**. Host: AMD Ryzen 7 4800H (Zen 2), Linux `7.2.11`,
-build `Release` `-O3 -march=native`, `chronosrt_bench --mode frame`, ejecución
-representativa (dispersión < 5 % entre ejecuciones) y coste del bucle vacío
-descontado.
+Rutas puras de CPU **sin NIC**, ejecutadas con `taskset` sobre el núcleo
+aislado **2**. Host: AMD Ryzen 7 4800H (Zen 2), Linux
+`7.3.0-2-cachyos-rt-bore` (**PREEMPT_RT**, `isolcpus=2,3 nohz_full=2,3
+rcu_nocbs=2,3 irqaffinity=0-1`, *governor* **`performance`**), build `Release`
+`-O3 -march=native`, `chronosrt_bench --mode frame`, ejecución representativa
+(dispersión < 5 % entre ejecuciones) y coste del bucle vacío descontado.
 
 | Ruta | Coste |
 | --- | ---: |
-| EtherCAT: construir datagrama de 1024 B | **24,0 ns** |
-| EtherCAT: parsear datagrama | **3,5–3,8 ns** |
-| EtherTux: construir PDU de 1464 B | **180,8 ns** |
-| EtherTux: construir cabecera sin copia (1464 B) | **140,8 ns** |
-| EtherTux: parsear + validar CRC (1464 B) | **138,6 ns** |
-| Flow Aggregator: 8 flujos × 32 B | **48,0 ns** |
-| Admisión QoS P2 / 576 B | **16,8 ns** |
-| CRC-32C con MTU completa (`sse4.2-x4`) | **9,70 GB/s · 6,45 M tramas/s** |
+| EtherCAT: construir datagrama de 1024 B | **23,6 ns** |
+| EtherCAT: parsear datagrama | **3,6 ns** |
+| EtherTux: construir PDU de 1464 B | **177,1 ns** |
+| EtherTux: construir cabecera sin copia (1464 B) | **141,2 ns** |
+| EtherTux: parsear + validar CRC (1464 B) | **133,6 ns** |
+| Flow Aggregator: 8 flujos × 32 B | **47,6 ns** |
+| Admisión QoS P2 / 576 B | **16,9 ns** |
+| CRC-32C con MTU completa (`sse4.2-x4`) | **10,55 GB/s · 7,02 M tramas/s** |
 
 Lectura: el coste de CPU queda muy por debajo del tiempo de transmisión; el
 límite práctico es el **enlace**, no el software.
+
+### Resultados de sistema en kernel RT con núcleos aislados
+
+Campaña del **2026-11-01** sobre `7.3.0-2-cachyos-rt-bore`. Condiciones reales
+del host: PREEMPT_RT activo, **núcleos 2–3 aislados** (`isolcpus`,
+`nohz_full`, `rcu_nocbs` e `irqaffinity=0-1`), *governor* **`performance`** y
+benchmark fijado con `taskset` a los núcleos aislados.
+
+| Modo | Configuración | Resultado |
+| --- | --- | ---: |
+| Latencia | 60 s, núcleo 2, `SCHED_FIFO` 80 | mín **0,080 µs** · media **0,090 µs** · σ **0,063 µs** · p50 **0,100 µs** · p99 **0,200 µs** · p99.9 **0,200 µs** · máx **31,999 µs** |
+| Jitter | 30 s, núcleo 2, `SCHED_FIFO` 80 | mín **0,080 µs** · media **0,090 µs** · σ **0,059 µs** · máx **27,220 µs** |
+| WCET | 10 s, núcleo 2, `SCHED_FIFO` 80 | WCET **38,702 µs** · media **0,090 µs** · σ **0,072 µs** |
+| Throughput | 2 hilos (1P+1C), núcleos 2–3, 10 s | **16,145 M eventos/s** (161 447 940) |
+| Throughput | 4 hilos (2P+2C), núcleos 2–3, 5 s | **9,446 M eventos/s**¹ |
+| Estrés | 2 hilos, núcleos 2–3, 10 s | sin errores ni bloqueos |
+
+¹ Con 4 hilos sobre solo 2 núcleos aislados hay sobre-suscripción: el benchmark
+**omite** `SCHED_FIFO` a propósito (más hilos que CPUs) porque un productor que
+nunca se bloquea hambrientaría al consumidor. Sin sobre-suscripción sí se eleva.
+
+> Throughput cuenta **publicaciones exitosas** (`event_publish == SUCCESS`) con
+> consumidores concurrentes; los rechazos por pool lleno no se contabilizan. El
+> benchmark informa también de los eventos **consumidos** para detectar
+> desequilibrios. Latencia y jitter miden el *round-trip* `publish` + `subscribe`
+> en un hilo.
+
+> **Sobre el pico de 27–39 µs.** El benchmark ya eleva cada hilo a `SCHED_FIFO`
+> (prioridad 80) —confirmado en la salida con `SCHED_FIFO: aplicado`—, bloquea
+> memoria con `mlockall` + *prefault* y ejecuta **20 000 iteraciones de
+> calentamiento** antes de medir. Aun así el WCET se mantiene en esa franja: los
+> picos son **7–15 muestras por millón** (≈ 3 700 de 472 M en latencia), no un
+> sesgo del camino crítico. La media (90 ns) y p50/p99/p99.9 (100/200/200 ns)
+> demuestran que la ruta es determinista; el WCET lo fija la cola de la
+> distribución, atribuible a eventos del *host* (SMI/firmware, interrupciones no
+> enmascarables, refresco de DRAM), no a la falta de prioridad RT ni al
+> calentamiento. Para acotarlo más hace falta hardware con *tuning* de BIOS o
+> aislamiento de IRQ aún más estricto, no cambios en el benchmark.
+
+```bash
+# Campaña reproducible (núcleos aislados 2 y 3, governor performance)
+taskset -c 2 ./build/chronosrt_bench --mode latency    --duration 60
+taskset -c 2 ./build/chronosrt_bench --mode jitter     --duration 30
+taskset -c 2 ./build/chronosrt_bench --mode wcet       --duration 10
+taskset -c 2,3 ./build/chronosrt_bench --mode throughput --duration 10 --threads 2
+taskset -c 2,3 ./build/chronosrt_bench --mode throughput --duration 5  --threads 4
+taskset -c 2,3 ./build/chronosrt_bench --mode stress     --duration 10 --threads 2
+taskset -c 2 ./build/chronosrt_bench --mode frame
+taskset -c 2 ./build/chronosrt_bench --mode crc --duration 1
+taskset -c 2 ./build/chronosrt_bench --mode aalid
+```
+
 
 <details>
 <summary><strong>Tablas completas, HAL e I+D+i</strong></summary>
@@ -337,12 +403,12 @@ límite práctico es el **enlace**, no el software.
 
 | Métrica (por trama) | EtherCAT | EtherTux v0.1.0 |
 | --- | --- | --- |
-| Construir, carga pequeña (32 / 64 B) | **9,95 ns** (32 B) | **59,8 ns** (64 B) |
-| Construir, control 512 B | 15,4 ns (256 B)¹ | **74,1 ns** |
-| Construir, carga máxima (1024 / 1464 B) | **24,0 ns** | **180,8 ns** (**140,8 ns** sin copiar) |
-| Parsear + validar integridad | **3,5–3,8 ns** | **47,9 ns** (512 B) · **138,6 ns** (1464 B) |
-| Tramas/s de CPU (carga máxima) | ~42 M/s | **5,5 M/s** (build) · **7,2 M/s** (parse) |
-| Coste CPU / tiempo de transmisión a 1 Gbps | **0,28 %** | **1,45 %** (1,10 % sin copia) |
+| Construir, carga pequeña (32 / 64 B) | **10,5 ns** (32 B) | **60,1 ns** (64 B) |
+| Construir, control 512 B | 15,6 ns (256 B)¹ | **71,6 ns** |
+| Construir, carga máxima (1024 / 1464 B) | **23,6 ns** | **177,1 ns** (**141,2 ns** sin copiar) |
+| Parsear + validar integridad | **3,6 ns** | **46,8 ns** (512 B) · **133,6 ns** (1464 B) |
+| Tramas/s de CPU (carga máxima) | ~42 M/s | **5,6 M/s** (build) · **7,5 M/s** (parse) |
+| Coste CPU / tiempo de transmisión a 1 Gbps | **0,28 %** | **1,42 %** (1,13 % sin copia) |
 
 ¹ En EtherCAT se mide 256 B como referencia intermedia; el datagrama admite
 hasta 1486 B.
@@ -357,13 +423,13 @@ hasta 1486 B.
 | ET-WKC: registrar y comparar contador | **66,6 ns** | por trama recibida (64 nodos) |
 | Topología: heartbeat de 64 nodos | **66,6 ns** | por superframe |
 | ET-MBX: segmento de 512 B + ACK | **7,0 ns** | 4,6 µs en el cable |
-| Flow Aggregator: construir 8 × 32 B | **48,0 ns** | por trama agregada |
+| Flow Aggregator: construir 8 × 32 B | **47,6 ns** | por trama agregada |
 | Flow Aggregator: parsear 8 flujos | **14,4 ns** | por trama agregada |
 | FRM: trama nueva | **12,3 ns** | ventana de deduplicación de 16 |
 | FRM: duplicado descartado | **3,2 ns** | copia redundante |
 
 **Flow Aggregator de extremo a extremo:** 8 flujos de 32 B en una trama de
-**320 B** cuestan **121 ns** de CPU frente a **383 ns** y **576 B** por separado:
+**320 B** cuestan **122 ns** de CPU frente a **390 ns** y **576 B** por separado:
 **−68 % de CPU** y **−44 % de bytes**.
 
 ### ID local determinista (MAC LAA, medido)
@@ -374,17 +440,17 @@ Medido con `chronosrt_bench --mode aalid` (mismo host y método):
 
 | Operación | Coste medido | Contexto |
 | --- | --- | --- |
-| ID candidato (CRC-32C plegado) | **5,2 ns** | por trama recibida (Nivel 1) |
-| ID candidato multiplicativo (*fallback*) | 8,3 ns | plataformas sin CRC-32C |
-| MAC LAA ↔ ID | **0,15 / 0,8 ns** | construir el destino / identificar el origen |
-| Filtro de destino en el maestro | **6,2 ns** | descarte temprano de tramas ajenas |
-| Backoff determinista (64 ranuras) | 7,4 ns | solo en admisión |
-| Admisión de un nodo nuevo | **62 ns** (\(O(1)\) amortizado) | fuera del superframe |
-| Reclamación de un nodo conocido | 10,6 ns | reinicio del nodo |
-| Búsqueda `{MAC → ID}` con 4096 nodos | 15,4 ns | tabla hash abierta |
-| Liberación explícita | ~620 ns | administrativa; recorre la tabla |
+| ID candidato (CRC-32C plegado) | **5,3 ns** | por trama recibida (Nivel 1) |
+| ID candidato multiplicativo (*fallback*) | 8,4 ns | plataformas sin CRC-32C |
+| MAC LAA ↔ ID | **0,72 / 0,05 ns** | construir el destino / identificar el origen |
+| Filtro de destino en el maestro | **6,3 ns** | descarte temprano de tramas ajenas |
+| Backoff determinista (64 ranuras) | 7,3 ns | solo en admisión |
+| Admisión de un nodo nuevo | **69,8 ns** (\(O(1)\) amortizado) | fuera del superframe |
+| Reclamación de un nodo conocido | 10,5 ns | reinicio del nodo |
+| Búsqueda `{MAC → ID}` con 4096 nodos | 12,4 ns | tabla hash abierta |
+| Liberación explícita | ~466 ns | administrativa; recorre la tabla |
 
-**Nivel 1 frente a Nivel 2.** El ID candidato cuesta 5,2 ns y no contiene ramas
+**Nivel 1 frente a Nivel 2.** El ID candidato cuesta 5,3 ns y no contiene ramas
 ni bucles: el camino de recepción es de tiempo constante e independiente del
 número de nodos. Pero con 16 bits **no garantiza unicidad** (la paradoja del
 cumpleaños supera el 50 % hacia los ~300 nodos). Por eso el maestro mantiene la
@@ -404,10 +470,10 @@ nodos por hash de la MAC (1–2 comparaciones) en lugar de barrer la lista.
 
 | Operación | Resultado |
 | --- | --- |
-| CRC-32C, trama de 60 B | **2,94 GB/s · 49,0 M tramas/s** |
-| CRC-32C, trama de 552 B | **10,76 GB/s · 19,5 M tramas/s** |
-| CRC-32C, trama de 1504 B | **9,70 GB/s · 6,45 M tramas/s** |
-| CRC-32C frente a `slice-by-8` | **×1,9 / ×6,1 / ×5,6** |
+| CRC-32C, trama de 60 B | **3,91 GB/s · 65,2 M tramas/s** |
+| CRC-32C, trama de 552 B | **12,18 GB/s · 22,1 M tramas/s** |
+| CRC-32C, trama de 1504 B | **10,55 GB/s · 7,02 M tramas/s** |
+| CRC-32C frente a `slice-by-8` | **×2,1 / ×6,7 / ×6,0** |
 | RS(10,8) codificar (8 × 1400 B) | 1,65 µs/bloque · **~6,8 GB/s** |
 | RS(16,8) codificar (8 × 1400 B) | 6,6 µs/bloque · **~1,7 GB/s** |
 | RS(10,8) decodificar 2 borrados | 8,1 µs/bloque · **~1,4 GB/s** |
@@ -419,7 +485,7 @@ carga ~55 ns (21 %) y resto ~8 ns. `crc32q` tiene *throughput* 1/ciclo pero
 **latencia 3 ciclos**, así que un solo flujo queda limitado a ~3 B/ciclo.
 
 1. **CRC multistream de 4 vías en tres niveles** (512/128/32 B): oculta la
-   latencia y combina con tablas de *skip*. Medido: **1,85 → 10,8 GB/s** (×5,8).
+   latencia y combina con tablas de *skip*. Medido en MTU: **1,78 → 10,55 GB/s** (×5,9).
 2. **Despacho sin `pthread_once`**: puntero de función con escritura atómica y
    carga relajada.
 3. **Construcción sin copia** (`ChronosRT_et_pdu_build_header`) y envío con dos
@@ -430,10 +496,10 @@ carga ~55 ns (21 %) y resto ~8 ns. `crc32q` tiene *throughput* 1/ciclo pero
 
 | Métrica | Antes (`slice-by-8`) | Después (`sse4.2-x4`) | Mejora |
 | --- | ---: | ---: | ---: |
-| CRC-32C, trama de 552 B | 1,76 GB/s | **10,76 GB/s** | ×6,1 |
-| CRC-32C, trama de 1504 B | 1,72 GB/s | **9,70 GB/s** | ×5,6 |
-| CRC-32C, trama de 60 B | 1,56 GB/s | **2,94 GB/s** | ×1,9 |
-| Tramas/s de CPU con CRC (MTU) | 1,14 M/s | **6,45 M/s** | ×5,7 |
+| CRC-32C, trama de 552 B | 1,82 GB/s | **12,18 GB/s** | ×6,7 |
+| CRC-32C, trama de 1504 B | 1,77 GB/s | **10,55 GB/s** | ×6,0 |
+| CRC-32C, trama de 60 B | 1,86 GB/s | **3,91 GB/s** | ×2,1 |
+| Tramas/s de CPU con CRC (MTU) | 1,18 M/s | **7,02 M/s** | ×6,0 |
 
 **Techo físico del enlace (tramas/s, 1 puerto):**
 
@@ -604,11 +670,18 @@ ctest --test-dir build --output-on-failure
 ./build/chronosrt_bench --mode wcet
 ./build/chronosrt_bench --mode frame      # coste por trama
 ./build/chronosrt_bench --mode crc        # CRC-32C por backend
+./build/chronosrt_bench --mode aalid      # ID local (MAC LAA)
 ```
 
 Opciones: `--pool-size N`, `--hugepages`, `--no-simd`, `--no-affinity`,
 `--platform <rpi4|rpi5|jetson_nano|jetson_orin|intel_nuc|orange_pi5|rock5b|x86_64_rt>`,
 `--help`.
+
+Cada hilo de medida se eleva a **`SCHED_FIFO` prioridad 80** (si hay permiso y
+CPUs suficientes), se fija a una CPU distinta dentro del conjunto permitido y
+hace **20 000 iteraciones de calentamiento** antes de la ventana. El informe
+incluye media, σ, **p50/p99/p99.9**, WCET y la tasa de **picos > 10 µs** (ppm),
+que es la métrica que decide si el WCET cumple el objetivo.
 
 Metodología y criterios: [BENCHMARKING.md](docs/BENCHMARKING.md).
 

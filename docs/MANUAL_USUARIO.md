@@ -573,6 +573,7 @@ ChronosRT Master proporciona métricas en tiempo real:
 # [chronosrt] Kernel: 7.2.11 (...)
 # [chronosrt] PREEMPT_RT: no
 # [chronosrt] AVISO: kernel sin PREEMPT_RT; la latencia determinista puede degradarse.
+# [chronosrt] SCHED_FIFO: aplicado (prioridad 80)
 #
 # === ChronosRT Benchmark Results ===
 # Total Events:        ...
@@ -582,6 +583,10 @@ ChronosRT Master proporciona métricas en tiempo real:
 # Max Latency (ns):    ...
 # Avg Latency (ns):    ...
 # StdDev (ns):         ...
+# p50 (ns):            ...
+# p99 (ns):            ...
+# p99.9 (ns):          ...
+# Spikes > 10 us:      ... (... ppm)
 # CPU Usage (%):       ...
 # ================================
 #
@@ -589,8 +594,11 @@ ChronosRT Master proporciona métricas en tiempo real:
 ```
 
 Los valores concretos dependen del host. En un kernel sin RT el estado puede ser
-`NEEDS OPTIMIZATION`; es la respuesta correcta, no un fallo de la biblioteca.
-Consulte [BENCHMARKING.md](BENCHMARKING.md) para interpretar las cifras.
+`NEEDS OPTIMIZATION - WCET > 10 μs`; es la respuesta correcta, no un fallo de la
+biblioteca. El benchmark eleva cada hilo a `SCHED_FIFO` 80, hace 20 000
+iteraciones de calentamiento y bloquea memoria; la línea `SCHED_FIFO: aplicado`
+confirma que las cifras son comparables. Consulte
+[BENCHMARKING.md](BENCHMARKING.md) para interpretar las cifras.
 
 
 ### 5.4 Rendimiento medido (referencia)
@@ -1685,8 +1693,11 @@ int main(int argc, char* argv[]) {
     // Reportar resultados
     ChronosRT_metrics_report(&metrics);
     
-    // Evaluar resultado
-    if (metrics.stddev_ns < 1000) {
+    // Evaluar resultado (el WCET manda sobre sigma)
+    if (metrics.wcet_ns > CHRONOSRT_LATENCY_TARGET_NS) {
+        printf("✗ WCET > 10 μs: %lu picos de %lu eventos\\n",
+               metrics.latency_spikes, metrics.total_events);
+    } else if (metrics.stddev_ns < 1000) {
         printf("✓ EXCELLENT: Jitter < 1 μs\\n");
     } else if (metrics.stddev_ns < 5000) {
         printf("✓ GOOD: Jitter < 5 μs\\n");
