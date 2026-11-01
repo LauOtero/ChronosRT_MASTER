@@ -21,7 +21,7 @@ Su superficie cubre cuatro pilares:
 
 Estado verificado en el host de referencia (AMD Ryzen 7 4800H, Linux 7.2.11,
 GCC 16.2.1, CMake 4.4.4): build `Release` **0 errores / 0 warnings**, `ctest`
-**9/9 suites**, **485 aserciones**, **295 símbolos `ChronosRT_*`**.
+**10/10 suites**, **547 aserciones**, **320 símbolos `ChronosRT_*`**.
 
 ---
 
@@ -90,12 +90,12 @@ superficie pública **plana y estable** para no romper los `#include`.
 | `src/hwaccel/` | `chronosrt_hwaccel.c`: CRC-32C, GF(2^8), Reed-Solomon, PHC |
 | `src/protocols/` | `chronosrt_protocol.c` (selección) |
 | `src/protocols/ethercat/` | `ec_frame`, `ec_socket`, `ec_master`, `ec_slave`, `ec_dc`, `ec_mailbox` |
-| `src/protocols/ethertux/` | `et_frame`, `et_fec`, `et_qos`, `et_sched`, `et_esm`, `et_sync`, `et_topology`, `et_mbx`, `et_flowagg`, `et_frm`, `et_socket`, `et_master` |
+| `src/protocols/ethertux/` | `et_frame`, `et_fec`, `et_qos`, `et_sched`, `et_esm`, `et_sync`, `et_topology`, `et_mbx`, `et_flowagg`, `et_frm`, `et_aalid`, `et_socket`, `et_master` |
 | `src/integration/` | `chronosrt_bridge.c`: puente genérico hacia un *sink* externo |
 | `src/simd/` | `chronosrt_simd.c`: *batch zero/copy* y *hash* vectorizados |
 | `src/benchmark/` | `chronosrt_benchmark.c`: motor de benchmarking |
 | `tools/benchmark.c` | CLI `chronosrt_bench` |
-| `tests/` | 9 suites de `ctest` |
+| `tests/` | 10 suites de `ctest` |
 
 ---
 
@@ -134,6 +134,10 @@ superficie pública **plana y estable** para no romper los `#include`.
 | `topology_on_frame` | O(1) | Búsqueda por MAC en registro acotado (64 nodos) |
 | `flowagg_build/parse` | O(k) | k flujos agregados |
 | `frm_note_rx` | O(1) | Ventana de deduplicación acotada |
+| `aalid_candidate` | O(1) | CRC-32C de 6 B plegado; sin ramas ni bucles |
+| `aalid_admit` | O(1) amortizado | Hash + cursor secuencial; solo en admisión |
+| `aalid_lookup` | O(1) medio | Tabla hash abierta con sondeo acotado |
+| `aalid_release` / `expire` | O(slots) | Recorrido de la tabla; fuera del superframe |
 
 ---
 
@@ -280,6 +284,7 @@ en el cable.
 | `et_mbx.c` | Mailbox ET-MBX (8 canales, segmentos de 512 B, ACK/NACK) |
 | `et_flowagg.c` | Agregación de flujos (`FlowCount > 1`) |
 | `et_frm.c` | Redundancia lógica de flujo y deduplicación |
+| `et_aalid.c` | ID local determinista: MAC LAA, ID candidato, admisión, expiración y persistencia |
 | `et_socket.c` | `AF_PACKET`/`0x88B5`, `SO_TXTIME`, `PACKET_TX_RING` |
 | `et_master.c` | Ciclo de vida, envío/recepción, nodos y heartbeat |
 
@@ -300,6 +305,23 @@ P0 puede transmitir en cualquier ventana.
 |---|---|---|
 | `SYSCALL` | `sendmsg`/`sendmmsg` (hasta 16 tramas) | Compatibilidad universal |
 | `RING` | `PACKET_TX_RING` mapeado en usuario; un `send()` vacía el lote | Por defecto en `AUTO` si el kernel lo permite |
+
+### 10.5 ID local y direccionamiento
+
+Cada nodo recibe una identidad de 16 bits que se codifica en una MAC
+administrada localmente (`02:00:00:00:ID[15:8]:ID[7:0]`). El receptor deriva el
+ID de la MAC con CRC-32C plegado (Nivel 1, 5,2 ns) y el maestro resuelve las
+colisiones de ese hash con un cursor secuencial determinista (Nivel 2), solo en
+admisión. Con el *heartbeat* la entrada CAM del switch no expira y el tráfico
+deja de inundarse a todos los puertos: el switch conmuta únicamente al puerto
+del nodo destino. El maestro indexa además sus nodos por hash de MAC (256
+cubos, 8 sondeos), de modo que la recepción no depende del número de nodos.
+
+Implementación: tabla hash abierta de `table_slots` ranuras (256 por defecto,
+redondeada a potencia de 2) con estados *libre* / *activo* / *tombstone*, más
+un bitmap de IDs ocupados. Consumo ≈ 14,4 KB con los valores por defecto
+(6 KB de tabla + 8 KB de bitmap). La admisión solo se ejecuta fuera del
+superframe; `release` y `expire` recorren la tabla (O(slots)).
 
 ---
 
@@ -380,11 +402,22 @@ Host: AMD Ryzen 7 4800H (Zen 2), Linux 7.2.11, `Release` `-O3`, con
 | EtherCAT: construir datagrama | 9,95 ns (32 B) | 15,4 ns (256 B) | 24,0 ns (1024 B) |
 | EtherCAT: parsear datagrama | 3,47 ns (32 B) | 3,82 ns (256 B) | 3,68 ns (1024 B) |
 
+### 14.3 ID local determinista (`--mode aalid`)
+
+| Operación | Coste medido | Contexto |
+|---|---:|---|
+| ID candidato (CRC-32C plegado) | 5,2 ns | por trama recibida (Nivel 1) |
+| MAC LAA ↔ ID | 0,15 / 0,8 ns | destino / origen |
+| Filtro de destino del maestro | 6,2 ns | descarte temprano |
+| Admisión de nodo nuevo | 62 ns | O(1) amortizado, fuera del superframe |
+| Búsqueda `{MAC → ID}` (4096 nodos) | 15,4 ns | tabla hash abierta |
+| Ciclo admisión + liberación | ~620 ns | administrativa |
+
 Otras rutas medidas: Flow Aggregator 8×32 B = **48,0 ns** (parseo 14,4 ns;
 agregado + PDU 121,2 ns frente a 390,7 ns en 8 PDUs), admisión QoS P2/576 B =
 **16,8 ns**, ventana TDMA = **4,2 ns**.
 
-### 14.3 Capacidad de la HAL (mismo host)
+### 14.4 Capacidad de la HAL (mismo host)
 
 | Operación | Resultado |
 |---|---|
@@ -435,7 +468,8 @@ Resultado en el host de referencia:
 | `chronosrt_test_hwaccel` | 40 |
 | `chronosrt_test_ethertux` | 103 |
 | `chronosrt_test_ethertux_v010` | 152 |
-| **Total** | **485** |
+| `chronosrt_test_aalid` | 62 |
+| **Total** | **547** |
 
 Los detalles de protocolo están en el [Manual Técnico §11](MANUAL_TECNICO.md)
 (EtherCAT) y §13 (EtherTux); las mediciones, en

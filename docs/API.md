@@ -1205,7 +1205,90 @@ ChronosRT_status_t  ChronosRT_et_frm_stats(const ChronosRT_et_frm_t* frm,
 
 Solo se duplican flujos P0/P1; el receptor deduplica por `(nodo, SeqNum)`.
 
-### 13.13 Maestro EtherTux
+### 13.13 ID local determinista (MAC LAA)
+
+Esquema de dos niveles: el receptor deriva un ID de 16 bits de la MAC (filtro de
+recepción de coste constante) y el maestro es la autoridad que garantiza la
+unicidad.
+
+```c
+#define ChronosRT_ET_LOCAL_ID_MAX  0xFFFFu
+#define ChronosRT_ET_LOCAL_ID_NONE 0xFFFFu
+
+/* MAC local: 02:00:00:00:ID[15:8]:ID[7:0] (U/L=1, I/G=0) */
+uint32_t ChronosRT_et_aalid_mac(uint16_t id, uint8_t out[6]);
+uint16_t ChronosRT_et_aalid_id_from_mac(const uint8_t mac[6]);
+
+/* Nivel 1: ID candidato (sin ramas ni bucles) */
+uint16_t ChronosRT_et_aalid_candidate(const uint8_t mac[6]);      /* CRC-32C plegado */
+uint16_t ChronosRT_et_aalid_candidate_mul(const uint8_t mac[6]);  /* fallback portable */
+uint32_t ChronosRT_et_aalid_backoff_slots(const uint8_t mac[6], uint32_t slots);
+
+typedef enum {
+    ChronosRT_ET_AALID_OK = 0, ChronosRT_ET_AALID_COLLISION = 1,
+    ChronosRT_ET_AALID_DUPLICATE = 2, ChronosRT_ET_AALID_CLONE = 3,
+    ChronosRT_ET_AALID_FULL = 4, ChronosRT_ET_AALID_INVALID = 5
+} ChronosRT_et_aalid_result_t;
+
+typedef struct {
+    uint16_t id_max;        /* IDs asignables - 1 (def. 65535)          */
+    uint32_t grace_ms;      /* tiempo de gracia sin heartbeat (def. 600000) */
+    uint32_t table_slots;   /* potencia de 2 (def. 256; 0 => 256)       */
+} ChronosRT_et_aalid_config_t;
+
+typedef struct {
+    uint64_t admissions, collisions, duplicates;
+    uint64_t released, expired, clone_mac;
+    uint32_t occupied;
+} ChronosRT_et_aalid_stats_t;
+
+ChronosRT_et_aalid_t* ChronosRT_et_aalid_create(const ChronosRT_et_aalid_config_t* cfg);
+void                  ChronosRT_et_aalid_destroy(ChronosRT_et_aalid_t* aalid);
+void                  ChronosRT_et_aalid_default_config(ChronosRT_et_aalid_config_t* cfg);
+
+ChronosRT_status_t ChronosRT_et_aalid_admit(ChronosRT_et_aalid_t* aalid, const uint8_t mac[6],
+                                            uint32_t nonce, uint64_t now_ms, uint16_t* out_id,
+                                            ChronosRT_et_aalid_result_t* out_result);
+ChronosRT_status_t ChronosRT_et_aalid_release(ChronosRT_et_aalid_t* aalid, uint16_t id);
+ChronosRT_status_t ChronosRT_et_aalid_lookup(const ChronosRT_et_aalid_t* aalid,
+                                             const uint8_t mac[6], uint16_t* out_id);
+ChronosRT_status_t ChronosRT_et_aalid_heartbeat(ChronosRT_et_aalid_t* aalid, uint16_t id,
+                                                uint64_t now_ms);
+uint32_t           ChronosRT_et_aalid_expire(ChronosRT_et_aalid_t* aalid, uint64_t now_ms);
+ChronosRT_status_t ChronosRT_et_aalid_stats(const ChronosRT_et_aalid_t* aalid,
+                                            ChronosRT_et_aalid_stats_t* out);
+bool               ChronosRT_et_aalid_is_occupied(const ChronosRT_et_aalid_t* aalid, uint16_t id);
+ChronosRT_status_t ChronosRT_et_aalid_save(const ChronosRT_et_aalid_t* aalid, const char* path);
+ChronosRT_status_t ChronosRT_et_aalid_load(ChronosRT_et_aalid_t* aalid, const char* path);
+```
+
+`admit` devuelve `ChronosRT_SUCCESS` con el ID final (también en colisión y en
+duplicado), `ChronosRT_ERROR_STATE` si la MAC está clonada (misma MAC con
+distinto `nonce`) y `ChronosRT_ERROR_FULL` si no quedan IDs. La asignación es
+determinista: la misma secuencia de llegadas produce siempre el mismo resultado
+y el *backoff* se deriva de la MAC, nunca de `rand()`.
+
+`save`/`load` persisten `{MAC → ID}` con reemplazo atómico (`tmp` + `rename`)
+para conservar la identidad tras un reinicio del maestro.
+
+**Configuración y memoria.** `id_max` fija el rango de IDs (65 536 por
+defecto) y `table_slots` el número de nodos que caben en la tabla hash
+(256 por defecto; `create` lo redondea a potencia de 2 entre 16 y 65 536).
+Con los valores por defecto el módulo ocupa ≈ **14,4 KB** (tabla 256 × 24 B +
+bitmap de 8 KB). Para más de 256 nodos, aumente `table_slots`.
+
+**Estados internos.** Cada ranura está *libre*, *activa* o es un *tombstone*
+de una entrada liberada. El sondeo lineal continúa sobre los *tombstones*
+para no romper las cadenas y los reutiliza al insertar.
+
+**Persistencia.** Fichero con cabecera de 16 B (`ETID`, versión 1 y número de
+entradas) seguida de 24 B por entrada (MAC, ID, `nonce` y `last_hb_ms`).
+
+**Complejidad.** `admit` y `lookup` son O(1) amortizado/medio; `release` y
+`expire` recorren la tabla (O(slots)) y son operaciones administrativas fuera
+del superframe.
+
+### 13.14 Maestro EtherTux
 
 ```c
 typedef struct {
@@ -1222,6 +1305,7 @@ typedef struct {
     uint64_t frames_tx, frames_rx, bytes_tx, bytes_rx;
     uint64_t dropped, backpressure, fec_blocks, frame_errors;
     uint64_t duplicates_tx, wkc_mismatches, sync_out_of_sync, mbx_retries;
+    uint64_t local_id_dropped;   /* descartadas por destino ajeno (ID local) */
 } ChronosRT_et_master_stats_t;
 ```
 
@@ -1279,14 +1363,38 @@ ChronosRT_status_t ChronosRT_et_master_send_mailbox(master, uint8_t channel,
 ChronosRT_status_t ChronosRT_et_master_send_fec_block(master, priority, flow_id,
                                                       const uint8_t* const* data,
                                                       uint32_t count, uint32_t len);
+ChronosRT_status_t ChronosRT_et_master_send_to(master, uint16_t dest_id, uint8_t priority,
+                                               ChronosRT_et_type_t type, uint8_t flow_id,
+                                               const void* payload, uint16_t len);
 int                ChronosRT_et_master_recv(master, ChronosRT_et_header_t* hdr,
                                             void* payload, uint32_t bufsize,
                                             uint32_t timeout_us);
 ```
 
 `send_batch` admite hasta 16 tramas en una sola llamada (`sendmmsg` o anillo TX).
+`send_to` usa la MAC LAA del nodo destino (unicast) en lugar de difusión.
 
-### 13.14 Modo de transmisión
+ID local en el maestro:
+
+```c
+ChronosRT_status_t ChronosRT_et_master_enable_local_ids(master,
+                                                        const ChronosRT_et_aalid_config_t* cfg);
+ChronosRT_status_t ChronosRT_et_master_set_local_id(master, uint16_t id);
+uint16_t           ChronosRT_et_master_local_id(const ChronosRT_et_master_t* master);
+ChronosRT_et_aalid_t* ChronosRT_et_master_aalid(master);
+ChronosRT_status_t ChronosRT_et_master_admit_node(master, const uint8_t mac[6],
+                                                  uint32_t nonce, uint64_t now_ms,
+                                                  uint16_t* out_id,
+                                                  ChronosRT_et_aalid_result_t* out_result);
+uint32_t           ChronosRT_et_master_expire_local_ids(master, uint64_t now_ms);
+bool               ChronosRT_et_master_accepts_destination(const master, const uint8_t mac[6]);
+```
+
+Con el ID local activo, la recepción descarta antes de parsear toda trama
+unicast dirigida a otro nodo (`local_id_dropped`) y los nodos se indexan por
+hash de MAC (1–2 comparaciones) en lugar de un barrido lineal.
+
+### 13.15 Modo de transmisión
 
 ```c
 typedef enum {
@@ -1303,7 +1411,7 @@ bool               ChronosRT_et_master_tx_ring_active(const ChronosRT_et_master_
 Con `PACKET_TX_RING` la trama se escribe en una ranura mapeada en espacio de
 usuario y un único `send()` vacía el lote completo.
 
-### 13.15 Nodos, heartbeat y estadísticas
+### 13.16 Nodos, heartbeat y estadísticas
 
 ```c
 uint16_t ChronosRT_et_master_last_wkc(const ChronosRT_et_master_t* master);
@@ -1405,8 +1513,8 @@ Compilación: `cc app.c -lchronosrt -lpthread -lm -ldl`.
 Estado verificado en el host de referencia (Linux 7.2.11, GCC 16.2.1, CMake 4.4.4):
 
 - Build `Release`: **0 errores, 0 warnings**.
-- `ctest`: **9/9 suites**, **485/485 aserciones**.
-- `libchronosrt.so` exporta **295 símbolos `ChronosRT_*`** con visibilidad
+- `ctest`: **10/10 suites**, **547/547 aserciones**.
+- `libchronosrt.so` exporta **320 símbolos `ChronosRT_*`** con visibilidad
   controlada.
 - HAL detectada: `crc32c_backend = "sse4.2-x4"`, `fec_backend = "avx2"`.
 

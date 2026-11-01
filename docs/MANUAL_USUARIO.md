@@ -232,8 +232,8 @@ cd build
 ctest --output-on-failure
 
 # Deberías ver:
-# 9/9 Test #9: chronosrt_test_ethertux_v010 ..... Passed
-# 100% tests passed out of 9
+# 10/10 Test #10: chronosrt_test_aalid .......... Passed
+# 100% tests passed out of 10
 ```
 
 Cada binario informa además su número de aserciones:
@@ -248,9 +248,10 @@ Cada binario informa además su número de aserciones:
 ./chronosrt_test_hwaccel       # 40/40
 ./chronosrt_test_ethertux      # 103/103
 ./chronosrt_test_ethertux_v010 # 152/152
+./chronosrt_test_aalid         # 62/62
 ```
 
-Total: **485 aserciones**.
+Total: **547 aserciones**.
 
 
 ### 3.3 Instalación en Plataformas Específicas
@@ -607,6 +608,9 @@ Cifras reales del host de referencia (AMD Ryzen 7 4800H, Linux 7.2.11, build
 | Flow Aggregator 8 flujos × 32 B | 48,0 ns |
 | Admisión QoS (P2, 576 B) | 16,8 ns |
 | CRC-32C con MTU completa (`sse4.2-x4`) | 9,70 GB/s · 6,45 M tramas/s |
+| ID local: ID candidato (CRC-32C plegado) | 5,2 ns |
+| ID local: filtro de destino | 6,2 ns |
+| ID local: admisión de un nodo nuevo | 62 ns |
 
 El coste de CPU queda muy por debajo del tiempo de transmisión del enlace. El
 detalle y la metodología están en [BENCHMARKING.md](BENCHMARKING.md).
@@ -615,7 +619,7 @@ detalle y la metodología están en [BENCHMARKING.md](BENCHMARKING.md).
 
 | Comando | Descripción |
 |---------|-------------|
-| `ctest --test-dir build --output-on-failure` | Ejecutar las 9 suites |
+| `ctest --test-dir build --output-on-failure` | Ejecutar las 10 suites |
 | `./chronosrt_test` | Suite de núcleo (20 aserciones) |
 | `./chronosrt_bench --mode=latency` | Benchmark de latencia |
 | `./chronosrt_bench --mode=throughput` | Benchmark de throughput |
@@ -624,6 +628,57 @@ detalle y la metodología están en [BENCHMARKING.md](BENCHMARKING.md).
 | `./chronosrt_bench --mode=wcet` | Análisis de WCET |
 | `./chronosrt_bench --mode=crc` | Capacidad de CRC-32C por backend |
 | `./chronosrt_bench --mode=frame` | Coste de construir/parsear por trama |
+
+### 5.6 Identidad de nodos (ID local determinista)
+
+Cada nodo puede usar una identidad de 16 bits codificada en su MAC
+(`02:00:00:00:ID[15:8]:ID[7:0]`). Ventajas operativas:
+
+- El switch aprende la MAC y **deja de inundar** la trama al resto de puertos.
+- La recepción descarta en ~6 ns las tramas dirigidas a otros nodos.
+- La identidad sobrevive a reinicios (la tabla `{MAC → ID}` se persiste).
+
+```c
+ChronosRT_et_master_t* m = ChronosRT_et_master_create();
+ChronosRT_et_aalid_config_t cfg;
+ChronosRT_et_aalid_default_config(&cfg);   /* 65 536 IDs, gracia de 10 min */
+
+ChronosRT_et_master_enable_local_ids(m, &cfg);
+ChronosRT_et_master_open_auto(m, "enp2s0");     /* detecta 1G/2.5G/10G */
+ChronosRT_et_master_set_local_id(m, 0x0102);    /* ID propio del maestro */
+
+/* Admisión de un nodo que envía su MAC de fábrica y un nonce */
+uint16_t id = 0;
+ChronosRT_et_aalid_result_t res;
+if (ChronosRT_et_master_admit_node(m, mac_fabrica, nonce, now_ms, &id, &res) ==
+    ChronosRT_SUCCESS) {
+    /* enviar al nodo por su identidad (unicast, sin difusión) */
+    ChronosRT_et_master_send_to(m, id, ChronosRT_ET_P2, ChronosRT_ET_TYPE_DATA,
+                                1, payload, len);
+}
+
+/* Mantenimiento periódico, fuera del superframe */
+ChronosRT_et_master_expire_local_ids(m, now_ms);
+ChronosRT_et_aalid_save(ChronosRT_et_master_aalid(m), "/var/lib/chronosrt/aalid.bin");
+```
+
+`admit_node` devuelve además el motivo en `res`: `OK`, `COLLISION` (se asignó
+otro ID porque el candidato estaba ocupado), `DUPLICATE` (la MAC ya tenía ID) o
+`CLONE` (misma MAC con otro nonce: se rechaza). El maestro acepta difusión
+siempre; el unicast solo si va dirigido a su MAC local.
+
+Límites y mantenimiento:
+
+- Rango de IDs: **65 536** (0 … 65 535). `ChronosRT_ET_LOCAL_ID_NONE` (0xFFFF)
+  significa «sin ID local»; con `send_to()` equivale a difusión.
+- La tabla soporta **256 nodos** por defecto (≈ 14 KB de RAM). Para más nodos,
+  suba `cfg.table_slots` (potencia de 2; 1024 ⇒ ≈ 24 KB de tabla).
+- `expire_local_ids()` libera los IDs sin heartbeat en `cfg.grace_ms` (10 min
+  por defecto). Llámelo una vez por superframe o en el hilo de baja prioridad.
+- `ChronosRT_et_aalid_release()` recorre la tabla (O(slots)); es administrativa,
+  no la invoque en el camino crítico.
+- El fichero de persistencia debe estar en un directorio con permiso de
+  escritura; `save()` y `load()` devuelven `ChronosRT_ERROR_IO` si falla.
 
 ---
 

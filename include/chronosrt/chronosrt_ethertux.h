@@ -604,6 +604,113 @@ CHRONOSRT_API ChronosRT_status_t ChronosRT_et_frm_stats(const ChronosRT_et_frm_t
                                                         ChronosRT_et_frm_stats_t* out);
 
 /* ------------------------------------------------------------------ */
+/* ID local determinista: MAC LAA derivada del ID (2 niveles)          */
+/*                                                                     */
+/* Nivel 1 (camino crítico): `ChronosRT_et_aalid_candidate()` calcula   */
+/* el ID candidato con CRC-32C + plegado XOR. Es una función sin ramas  */
+/* ni bucles, de tiempo constante, y NO garantiza unicidad: con 16     */
+/* bits la paradoja del cumpleaños aparece hacia los ~300 nodos.        */
+/*                                                                     */
+/* Nivel 2 (solo admisión): el maestro es la autoridad final. Mantiene  */
+/* una tabla {MAC de fábrica -> ID} y un bitmap de IDs ocupados;        */
+/* resuelve colisiones con un cursor secuencial determinista, fuera del */
+/* superframe. El resultado es único en régimen permanente.             */
+/* ------------------------------------------------------------------ */
+
+#define ChronosRT_ET_LOCAL_ID_MAX  0xFFFFu   /* 65.536 identificadores */
+#define ChronosRT_ET_LOCAL_ID_NONE 0xFFFFu
+
+/**
+ * MAC local (LAA) del ID: `02:00:00:00:ID[15:8]:ID[7:0]`. El bit U/L queda
+ * a 1 (dirección administrada localmente) y el I/G a 0 (unicast).
+ */
+CHRONOSRT_API uint32_t ChronosRT_et_aalid_mac(uint16_t id, uint8_t out[6]);
+
+/** ID codificado en una MAC local; `ChronosRT_ET_LOCAL_ID_NONE` si no lo es. */
+CHRONOSRT_API uint16_t ChronosRT_et_aalid_id_from_mac(const uint8_t mac[6]);
+
+/** Nivel 1: ID candidato (CRC-32C de la MAC plegado a 16 bits). */
+CHRONOSRT_API uint16_t ChronosRT_et_aalid_candidate(const uint8_t mac[6]);
+
+/** Nivel 1 alternativo sin CRC: hash multiplicativo (fallback portable). */
+CHRONOSRT_API uint16_t ChronosRT_et_aalid_candidate_mul(const uint8_t mac[6]);
+
+/**
+ * Backoff determinista derivado de la MAC: entero en `[0, slots)`. Reproducible
+ * entre ejecuciones (a diferencia de `rand()`) y distinto para MACs distintas.
+ * `slots` debe ser potencia de 2.
+ */
+CHRONOSRT_API uint32_t ChronosRT_et_aalid_backoff_slots(const uint8_t mac[6], uint32_t slots);
+
+/** Resultado de una solicitud de admisión. */
+typedef enum {
+    ChronosRT_ET_AALID_OK = 0,           /* ID candidato libre            */
+    ChronosRT_ET_AALID_COLLISION = 1,    /* candidato ocupado: se resolvió */
+    ChronosRT_ET_AALID_DUPLICATE = 2,    /* la MAC ya tenía ID: se devuelve */
+    ChronosRT_ET_AALID_CLONE = 3,        /* misma MAC, distinto nonce      */
+    ChronosRT_ET_AALID_FULL = 4,         /* no quedan IDs libres           */
+    ChronosRT_ET_AALID_INVALID = 5
+} ChronosRT_et_aalid_result_t;
+
+typedef struct {
+    uint16_t id_max;        /* IDs asignables - 1 (def. 65535)             */
+    uint32_t grace_ms;      /* tiempo de gracia sin heartbeat (def. 600000)*/
+    uint32_t table_slots;   /* potencia de 2 (def. 1024; 0 => 1024)        */
+} ChronosRT_et_aalid_config_t;
+
+typedef struct {
+    uint64_t admissions;    /* IDs concedidos                              */
+    uint64_t collisions;    /* candidatos ocupados que hubo que reasignar  */
+    uint64_t duplicates;    /* reclamaciones de una MAC ya registrada      */
+    uint64_t released;      /* liberaciones explícitas                     */
+    uint64_t expired;       /* IDs liberados por timeout de heartbeat      */
+    uint64_t clone_mac;     /* solicitudes con MAC clonada (rechazadas)    */
+    uint32_t occupied;      /* IDs en uso                                  */
+} ChronosRT_et_aalid_stats_t;
+
+typedef struct ChronosRT_et_aalid ChronosRT_et_aalid_t;
+
+CHRONOSRT_API void ChronosRT_et_aalid_default_config(ChronosRT_et_aalid_config_t* cfg);
+CHRONOSRT_API ChronosRT_et_aalid_t* ChronosRT_et_aalid_create(const ChronosRT_et_aalid_config_t* cfg);
+CHRONOSRT_API void ChronosRT_et_aalid_destroy(ChronosRT_et_aalid_t* aalid);
+
+/**
+ * Resuelve el ID final de `mac` (Nivel 2). Determinista: la misma secuencia de
+ * llegadas produce siempre la misma asignación. Devuelve SUCCESS con el ID en
+ * `out_id` (también en duplicados y colisiones) o `ChronosRT_ERROR_STATE` si la
+ * MAC está clonada, `ChronosRT_ERROR_FULL` si no quedan IDs.
+ */
+CHRONOSRT_API ChronosRT_status_t ChronosRT_et_aalid_admit(ChronosRT_et_aalid_t* aalid,
+                                                          const uint8_t mac[6],
+                                                          uint32_t nonce,
+                                                          uint64_t now_ms,
+                                                          uint16_t* out_id,
+                                                          ChronosRT_et_aalid_result_t* out_result);
+
+CHRONOSRT_API ChronosRT_status_t ChronosRT_et_aalid_release(ChronosRT_et_aalid_t* aalid,
+                                                           uint16_t id);
+CHRONOSRT_API ChronosRT_status_t ChronosRT_et_aalid_lookup(const ChronosRT_et_aalid_t* aalid,
+                                                           const uint8_t mac[6],
+                                                           uint16_t* out_id);
+/** Refresca el temporizador de vida de un ID (mantiene viva la entrada CAM). */
+CHRONOSRT_API ChronosRT_status_t ChronosRT_et_aalid_heartbeat(ChronosRT_et_aalid_t* aalid,
+                                                              uint16_t id, uint64_t now_ms);
+/** Libera los IDs sin heartbeat dentro del tiempo de gracia. Devuelve cuántos. */
+CHRONOSRT_API uint32_t ChronosRT_et_aalid_expire(ChronosRT_et_aalid_t* aalid, uint64_t now_ms);
+CHRONOSRT_API ChronosRT_status_t ChronosRT_et_aalid_stats(const ChronosRT_et_aalid_t* aalid,
+                                                          ChronosRT_et_aalid_stats_t* out);
+CHRONOSRT_API bool ChronosRT_et_aalid_is_occupied(const ChronosRT_et_aalid_t* aalid, uint16_t id);
+
+/**
+ * Persistencia {MAC -> ID} para conservar la identidad tras un reinicio.
+ * `save` escribe de forma atómica (fichero temporal + `rename`).
+ */
+CHRONOSRT_API ChronosRT_status_t ChronosRT_et_aalid_save(const ChronosRT_et_aalid_t* aalid,
+                                                         const char* path);
+CHRONOSRT_API ChronosRT_status_t ChronosRT_et_aalid_load(ChronosRT_et_aalid_t* aalid,
+                                                         const char* path);
+
+/* ------------------------------------------------------------------ */
 /* Nodos y maestro                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -631,6 +738,7 @@ typedef struct {
     uint64_t wkc_mismatches;    /* discrepancias de ET-WKC observadas      */
     uint64_t sync_out_of_sync;  /* nodos marcados fuera de sincronización  */
     uint64_t mbx_retries;       /* reintentos de ET-MBX                    */
+    uint64_t local_id_dropped;  /* descartadas por destino ajeno (ID local) */
 } ChronosRT_et_master_stats_t;
 
 typedef struct ChronosRT_et_master ChronosRT_et_master_t;
@@ -669,6 +777,57 @@ CHRONOSRT_API ChronosRT_status_t ChronosRT_et_master_attach_mbx(ChronosRT_et_mas
                                                                ChronosRT_et_mbx_t* mbx);
 CHRONOSRT_API ChronosRT_status_t ChronosRT_et_master_attach_frm(ChronosRT_et_master_t* master,
                                                                ChronosRT_et_frm_t* frm);
+
+/* --- ID local determinista en el maestro ---------------------------- */
+
+/**
+ * Activa el esquema de ID local (Nivel 2) en el maestro. A partir de aquí la
+ * recepción descarta las tramas cuyo destino no sea la MAC local ni difusión, y
+ * los nodos se identifican con su ID (O(1)) en lugar de buscar por MAC.
+ */
+CHRONOSRT_API ChronosRT_status_t ChronosRT_et_master_enable_local_ids(
+        ChronosRT_et_master_t* master, const ChronosRT_et_aalid_config_t* cfg);
+
+/** Fija el ID local del maestro y deriva de él su MAC de origen (LAA). */
+CHRONOSRT_API ChronosRT_status_t ChronosRT_et_master_set_local_id(ChronosRT_et_master_t* master,
+                                                                  uint16_t id);
+
+/** ID local del maestro (`ChronosRT_ET_LOCAL_ID_NONE` si no hay). */
+CHRONOSRT_API uint16_t ChronosRT_et_master_local_id(const ChronosRT_et_master_t* master);
+
+/** Autoridad de admisión: resuelve el ID final de una MAC (Nivel 2). */
+CHRONOSRT_API ChronosRT_status_t ChronosRT_et_master_admit_node(ChronosRT_et_master_t* master,
+                                                                const uint8_t mac[6],
+                                                                uint32_t nonce,
+                                                                uint64_t now_ms,
+                                                                uint16_t* out_id,
+                                                                ChronosRT_et_aalid_result_t* out_result);
+
+/** Libera los IDs sin heartbeat dentro del tiempo de gracia. Devuelve cuántos. */
+CHRONOSRT_API uint32_t ChronosRT_et_master_expire_local_ids(ChronosRT_et_master_t* master,
+                                                            uint64_t now_ms);
+
+/**
+ * `true` si una trama dirigida a `mac` interesa a este maestro (difusión o la
+ * propia MAC local). Es el filtro del camino de recepción, en tiempo constante.
+ */
+CHRONOSRT_API bool ChronosRT_et_master_accepts_destination(const ChronosRT_et_master_t* master,
+                                                           const uint8_t mac[6]);
+
+/** Estado de admisión asociado (NULL si no está activado). */
+CHRONOSRT_API ChronosRT_et_aalid_t* ChronosRT_et_master_aalid(ChronosRT_et_master_t* master);
+
+/**
+ * Envía a un nodo concreto usando su ID local (destino unicast `02:...:ID`), en
+ * lugar de difusión: evita el *flooding* del switch y el tráfico parásito en el
+ * resto de puertos. `dest_id == ChronosRT_ET_LOCAL_ID_NONE` equivale a difusión.
+ */
+CHRONOSRT_API ChronosRT_status_t ChronosRT_et_master_send_to(ChronosRT_et_master_t* master,
+                                                             uint16_t dest_id,
+                                                             uint8_t priority,
+                                                             ChronosRT_et_type_t type,
+                                                             uint8_t flow_id,
+                                                             const void* payload, uint16_t len);
 
 /** ET-WKC de la última trama recibida. */
 CHRONOSRT_API uint16_t ChronosRT_et_master_last_wkc(const ChronosRT_et_master_t* master);

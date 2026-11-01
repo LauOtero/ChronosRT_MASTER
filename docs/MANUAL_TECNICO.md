@@ -106,6 +106,10 @@ ChronosRT Master Core
 | `bounded_pop()` | O(1) | O(1) | 1 CAS |
 | `mem_pool_alloc()` | O(1) | O(1) | 1 pop de free-list |
 | `mem_pool_free()` | O(1) | O(1) | 1 push a free-list |
+| `aalid_candidate()` | O(1) | O(1) | CRC-32C de 6 B plegado (sin ramas) |
+| `aalid_admit()` | O(1) amortizado | O(1) | Hash + cursor secuencial |
+| `aalid_lookup()` | O(1) medio | O(1) | Tabla hash abierta |
+| `aalid_release()` | O(slots) | O(1) | Recorrido de la tabla |
 
 La cola Michael-Scott (`chronosrt_mpmc.h`) se conserva como referencia; su
 `push`/`pop` asigna y libera nodos, por lo que **no** se usa en el camino
@@ -1289,6 +1293,45 @@ void optimized_process_batch(event_batch_t* batch) {
 }
 ```
 
+### 9.3 ID local determinista (EtherTux)
+
+Identidad de 16 bits en una MAC LAA (`02:00:00:00:ID[15:8]:ID[7:0]`) con dos
+niveles: el receptor deriva el ID candidato de la MAC (CRC-32C plegado) y el
+maestro resuelve las colisiones con un cursor secuencial determinista solo en
+admisión. El coste del camino crítico es de tiempo constante:
+
+| Operación | Coste medido | Notas |
+|---|---:|---|
+| ID candidato (CRC-32C plegado) | 5,2 ns | sin ramas ni bucles |
+| `ID → MAC` / `MAC → ID` | 0,15 / 0,8 ns | identidad en el cable |
+| Filtro de destino del maestro | 6,2 ns | descarta antes de parsear |
+| Admisión (nodo nuevo) | 62 ns | O(1) amortizado, fuera del superframe |
+| Búsqueda `{MAC → ID}` | 15,4 ns | tabla hash abierta |
+
+Con el ID activo, la recepción descarta las tramas unicast ajenas
+(`local_id_dropped`), los nodos se indexan por hash de MAC y el maestro puede
+emitir unicast con `send_to()` en lugar de difusión, lo que evita el *flooding*
+del switch. La tabla `{MAC → ID}` se persiste con reemplazo atómico.
+
+**Flujo de admisión (`ChronosRT_et_aalid_admit`):**
+
+1. Se calcula el ID candidato (CRC-32C de la MAC plegado) y se indexa la tabla.
+2. Si la MAC ya está registrada con el mismo `nonce`, se refresca su
+   `last_hb_ms` y se devuelve el ID existente (`DUPLICATE`); si el `nonce`
+   difiere, se rechaza como MAC clonada (`CLONE`, `ChronosRT_ERROR_STATE`).
+3. Si el candidato está libre en el bitmap, se asigna (`OK`). Si está ocupado,
+   `et_aalid_find_free` busca el primer hueco desde `next_free_hint` y en
+   envolvente (`COLLISION`).
+4. Se inserta en la primera ranura libre o *tombstone* de la cadena de sondeo,
+   se marca el bit y se avanza el cursor. Sin hueco, `FULL`.
+5. `expire` libera los IDs sin heartbeat dentro de `grace_ms` (10 min por
+   defecto) y deja *tombstones* reutilizables.
+
+Memoria: ≈ 14,4 KB con los valores por defecto (tabla de 256 ranuras × 24 B y
+bitmap de 8 KB). Persistencia: cabecera de 16 B (`ETID`, versión 1, número de
+entradas) y 24 B por entrada (MAC, ID, `nonce`, `last_hb_ms`), con escritura
+`tmp` + `rename`.
+
 ---
 
 ## 10. Seguridad y Cifrado
@@ -1803,7 +1846,7 @@ QoS (degradación, backpressure, LAPM con histéresis), ventanas del planificado
 ciclo de vida del maestro, ET-ESM, ET-Sync y monitor de ventana, ET-WKC y
 topología, ET-MBX, Flow Aggregator, FRM y degradación elegante sin `CAP_NET_RAW`.
 
-Estado global: **9 suites / 485 aserciones**, build `Release` sin errores ni
+Estado global: **10 suites / 547 aserciones**, build `Release` sin errores ni
 advertencias.
 
 ---
@@ -2552,7 +2595,7 @@ watch -n1 'cat /proc/interrupts | head -20'
 - ✅ Maestro EtherCAT autónomo (`AF_PACKET`/`0x88A4`): escaneo, SM/FMMU, ESM, DC, CoE/SDO, WKC, redundancia
 - ✅ EtherTux v0.1.0 (`0x88B5`): cabecera de 26 B, QoS P0–P5, LAPM, FEC, ET-ESM, ET-Sync, ET-WKC/topología, ET-MBX, FRM, Flow Aggregator, anillo TX
 - ✅ Integración como proveedor (`tuxrt_provider_descriptor`) y puente desacoplado
-- ✅ 9 suites de test / 485 aserciones; 295 símbolos `ChronosRT_*`
+- ✅ 10 suites de test / 547 aserciones; 320 símbolos `ChronosRT_*`
 
 **Medido en el host de referencia (AMD Ryzen 7 4800H, Linux 7.2.11):**
 - Construir datagrama EtherCAT de 1024 B: 24,0 ns

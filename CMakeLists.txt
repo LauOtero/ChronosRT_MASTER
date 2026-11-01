@@ -139,6 +139,7 @@ if(CHRONOSRT_BUILD_PROTOCOLS)
         src/protocols/ethertux/et_mbx.c
         src/protocols/ethertux/et_flowagg.c
         src/protocols/ethertux/et_frm.c
+        src/protocols/ethertux/et_aalid.c
         src/protocols/ethertux/et_socket.c
         src/protocols/ethertux/et_master.c
     )
@@ -280,6 +281,7 @@ if(CHRONOSRT_BUILD_TESTS)
         chronosrt_test_hwaccel     tests/test_hwaccel.c
         chronosrt_test_ethertux    tests/test_ethertux.c
         chronosrt_test_ethertux_v010 tests/test_ethertux_v010.c
+        chronosrt_test_aalid        tests/test_aalid.c
     )
 
     list(LENGTH CHRONOSRT_TESTS _n)

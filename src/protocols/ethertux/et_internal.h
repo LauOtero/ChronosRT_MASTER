@@ -30,6 +30,10 @@
 /* Número máximo de ranuras del superframe. */
 #define ET_MAX_SLOTS 64u
 
+/* Índice hash de nodos del maestro (sondeo lineal acotado). */
+#define ET_NODE_HASH_SLOTS  256u
+#define ET_NODE_HASH_PROBES 8u
+
 /* Ventanas del superframe (índices). */
 #define ET_WINDOW_CONTROL       0u
 #define ET_WINDOW_DETERMINISTIC 1u
@@ -122,6 +126,11 @@ struct ChronosRT_et_master {
 
     ChronosRT_et_node_t nodes[ChronosRT_ET_MAX_NODES];
     uint32_t            node_count;
+    uint8_t             node_hash[ET_NODE_HASH_SLOTS];  /* índice+1, 0 = vacío */
+
+    /* ID local determinista (Nivel 2): NULL = esquema desactivado. */
+    ChronosRT_et_aalid_t* aalid;
+    uint16_t              local_id;      /* ChronosRT_ET_LOCAL_ID_NONE si no hay */
 
     uint32_t seq[ChronosRT_ET_MAX_FLOWS + 1u];
     uint16_t block_seq;

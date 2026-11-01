@@ -48,6 +48,110 @@ static double bench_loop_overhead(void) {
 }
 
 /*
+ * Coste del esquema de ID local: Nivel 1 (camino crítico) y Nivel 2 (admisión),
+ * más el filtro de destino del maestro.
+ */
+static void bench_aalid(void) {
+    static uint8_t macs[64][6];
+    uint8_t out[6];
+    uint16_t id = 0u;
+    uint32_t k = 0u;
+
+    g_loop_ns = bench_loop_overhead();
+
+    for (unsigned i = 0; i < 64u; i++) {
+        macs[i][0] = 0x00u;
+        macs[i][1] = 0x1Au;
+        macs[i][2] = 0x2Bu;
+        macs[i][3] = 0xC0u;
+        macs[i][4] = (uint8_t)(i >> 8);
+        macs[i][5] = (uint8_t)i;
+    }
+
+    printf("Nivel 1 (camino crítico de recepción):\n");
+    BENCH("ID candidato (CRC-32C plegado)", {
+        g_sink += ChronosRT_et_aalid_candidate(macs[k++ & 63u]);
+    });
+    BENCH("ID candidato (multiplicativo)", {
+        g_sink += ChronosRT_et_aalid_candidate_mul(macs[k++ & 63u]);
+    });
+    BENCH("MAC local <- ID (LAA)", {
+        g_sink += ChronosRT_et_aalid_mac((uint16_t)k++, out);
+    });
+    BENCH("ID del origen a partir de la MAC", {
+        g_sink += ChronosRT_et_aalid_id_from_mac(out);
+    });
+    BENCH("backoff determinista (64 slots)", {
+        g_sink += ChronosRT_et_aalid_backoff_slots(macs[k++ & 63u], 64u);
+    });
+
+    printf("\nNivel 2 (admisión, fuera del superframe):\n");
+    ChronosRT_et_aalid_config_t acfg;
+    ChronosRT_et_aalid_default_config(&acfg);
+    acfg.table_slots = 8192u;          /* holgado para 4096 nodos de prueba */
+    ChronosRT_et_aalid_t* aal = ChronosRT_et_aalid_create(&acfg);
+    if (aal != NULL) {
+        ChronosRT_et_aalid_result_t res;
+        uint8_t mnuevo[6];
+        memset(mnuevo, 0, sizeof(mnuevo));
+        mnuevo[1] = 0x1Au;
+        mnuevo[2] = 0x2Bu;
+        mnuevo[3] = 0xD0u;
+
+        /* Admisiones nuevas: se mide el total de 4096 altas (no cabe en BENCH
+         * porque cada MAC solo puede admitirse una vez). */
+        const uint64_t t0 = now_ns();
+        for (uint32_t i = 0; i < 4096u; i++) {
+            mnuevo[4] = (uint8_t)(i >> 8);
+            mnuevo[5] = (uint8_t)i;
+            (void)ChronosRT_et_aalid_admit(aal, mnuevo, i + 1u, 0u, &id, &res);
+        }
+        printf("  %-40s %9.1f ns\n", "admisión de un nodo nuevo (4096 altas)",
+               (double)(now_ns() - t0) / 4096.0);
+
+        BENCH("reclamación de un nodo conocido", {
+            g_sink += ChronosRT_et_aalid_admit(aal, macs[0], 1u, 0u, &id, &res);
+        });
+        BENCH("búsqueda {MAC -> ID} con 4096 nodos", {
+            g_sink += ChronosRT_et_aalid_lookup(aal, macs[k++ & 63u], &id);
+        });
+
+        /* Ciclo completo con liberación explícita (recorre la tabla). */
+        acfg.table_slots = 256u;       /* tabla típica de una SBC */
+        ChronosRT_et_aalid_t* aal2 = ChronosRT_et_aalid_create(&acfg);
+        static uint8_t mciclo[6];
+        memset(mciclo, 0, sizeof(mciclo));
+        mciclo[1] = 0x1Au;
+        mciclo[2] = 0x2Bu;
+        mciclo[3] = 0xE0u;
+        if (aal2 != NULL) {
+            BENCH("ciclo admisión + liberación explícita", {
+                mciclo[4] = (uint8_t)(k >> 8);
+                mciclo[5] = (uint8_t)k;
+                g_sink += ChronosRT_et_aalid_admit(aal2, mciclo, k, 0u, &id, &res);
+                (void)ChronosRT_et_aalid_release(aal2, id);
+                k++;
+            });
+            ChronosRT_et_aalid_destroy(aal2);
+        }
+        ChronosRT_et_aalid_destroy(aal);
+    }
+
+    ChronosRT_et_master_t* m = ChronosRT_et_master_create();
+    if (m != NULL) {
+        (void)ChronosRT_et_master_set_local_id(m, 0x0102u);
+        printf("\nFiltro del maestro:\n");
+        BENCH("filtro de destino (unicast propio)", {
+            uint8_t self[6];
+            (void)ChronosRT_et_aalid_mac(0x0102u, self);
+            g_sink += ChronosRT_et_master_accepts_destination(m, self);
+        });
+        ChronosRT_et_master_destroy(m);
+    }
+    printf("\n");
+}
+
+/*
  * Coste de las rutas puras de trama (sin NIC): construir, construir sin copiar
  * la carga útil y parsear + validar, en ambos protocolos, más las operaciones
  * auxiliares (Flow Aggregator y decisión de admisión QoS).
@@ -238,7 +342,7 @@ static void print_usage(const char* program) {
     printf("Usage: %s [options]\n", program);
     printf("\nOptions:\n");
     printf("  --mode MODE       Benchmark mode: latency, throughput, jitter, stress, wcet,\n");
-    printf("                    crc (CRC-32C por backend) o frame (construir/parsear por trama)\n");
+    printf("                    crc (CRC-32C), frame (construir/parsear) o aalid (ID local)\n");
     printf("  --duration SEC    Test duration in seconds (default: 10)\n");
     printf("  --threads N       Number of threads for multi-threaded tests (default: 4)\n");
     printf("  --pool-size N     Event pool size (default: 65536)\n");
@@ -286,6 +390,7 @@ int main(int argc, char* argv[]) {
     uint32_t threads = 4;
     bool crc_mode = false;
     bool frame_mode = false;
+    bool aalid_mode = false;
     config.event_pool_size = 65536;
     config.batch_size = 256;
     config.stack_size_kb = 256;
@@ -318,6 +423,8 @@ int main(int argc, char* argv[]) {
                     crc_mode = true;
                 } else if (strcmp(optarg, "frame") == 0) {
                     frame_mode = true;
+                } else if (strcmp(optarg, "aalid") == 0) {
+                    aalid_mode = true;
                 } else {
                     mode = parse_mode(optarg);
                 }
@@ -359,6 +466,10 @@ int main(int argc, char* argv[]) {
     }
     if (frame_mode) {
         bench_frame();
+        return 0;
+    }
+    if (aalid_mode) {
+        bench_aalid();
         return 0;
     }
 

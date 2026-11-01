@@ -6,7 +6,7 @@
 [![ABI](https://img.shields.io/badge/ABI-0x000100-informational.svg)](#estado-del-proyecto)
 [![C11](https://img.shields.io/badge/C-11-00599C.svg)](#requisitos)
 [![Linux](https://img.shields.io/badge/Linux-5.15%2B%20%7C%207.x-success.svg)](#requisitos)
-[![Tests](https://img.shields.io/badge/tests-9%2F9%20suites-brightgreen.svg)](#tests)
+[![Tests](https://img.shields.io/badge/tests-10%2F10%20suites-brightgreen.svg)](#tests)
 [![Licencia](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](#licencia)
 
 ChronosRT Master es una biblioteca C11 (`libchronosrt.so`, ABI `0x000100`) que
@@ -23,7 +23,9 @@ hardware o el kernel no está preparado.
 
 - **EtherCAT autónomo** (`AF_PACKET`, `0x88A4`): sin SOEM, IgH ni DPDK.
 - **EtherTux v0.1.0** (`AF_PACKET`, `0x88B5`): Ethernet comercial determinista.
-- **9 suites / 485 aserciones** · **295 símbolos `ChronosRT_*`** · build `Release` sin warnings.
+- **ID local determinista**: MAC LAA derivada del ID, filtro de recepción O(1) y
+  admisión con autoridad central (sin *flooding* del switch).
+- **10 suites / 547 aserciones** · **320 símbolos `ChronosRT_*`** · build `Release` sin warnings.
 
 ---
 
@@ -85,7 +87,7 @@ Datos verificados en el host de referencia (**AMD Ryzen 7 4800H**, Linux
 | Comprobación | Resultado |
 | --- | --- |
 | Compilación | **0 errores, 0 warnings** |
-| `ctest` | **9/9 suites**, **485 aserciones** |
+| `ctest` | **10/10 suites**, **547 aserciones** |
 | Símbolos exportados | **295 `ChronosRT_*`** con visibilidad controlada |
 | HAL detectada | `crc32c_backend = "sse4.2-x4"`, `fec_backend = "avx2"` |
 | Benchmark | `--mode frame` y `--mode crc` reproducible |
@@ -195,7 +197,7 @@ ChronosRT_MASTER/
 ├── include/chronosrt/        # API pública plana y estable (ABI)
 ├── tools/benchmark.c         # CLI chronosrt_bench
 ├── scripts/                  # build.sh, test_runner.sh, lib/sbc.sh
-├── tests/                    # 9 suites
+├── tests/                    # 10 suites
 └── docs/                     # manuales, API, portación, informes
 ```
 
@@ -213,7 +215,7 @@ ChronosRT_MASTER/
 | `chronosrt_hwaccel.h` | Matriz de ISA, CRC-32C, GF(2^8), RS(N,K) y PHC/Launch Time. |
 | `chronosrt_protocol.h` | `ChronosRT_protocol_default/from_string/from_env/name`. |
 | `chronosrt_ethercat.h` | Maestro EtherCAT completo. |
-| `chronosrt_ethertux.h` | EtherTux v0.1.0 completo. |
+| `chronosrt_ethertux.h` | EtherTux v0.1.0 completo, ID local determinista (MAC LAA) y TX por anillo. |
 | `chronosrt_tuxrt.h` | Puente de eventos y coexistencia de ABI. |
 | `chronosrt_abi.h` | Versión, ABI numérico, visibilidad y alineación. |
 
@@ -364,6 +366,40 @@ hasta 1486 B.
 **320 B** cuestan **121 ns** de CPU frente a **383 ns** y **576 B** por separado:
 **−68 % de CPU** y **−44 % de bytes**.
 
+### ID local determinista (MAC LAA, medido)
+
+Esquema de dos niveles: el receptor deriva un ID de 16 bits de la MAC (filtro
+compacto y determinista) y el maestro es la autoridad que garantiza unicidad.
+Medido con `chronosrt_bench --mode aalid` (mismo host y método):
+
+| Operación | Coste medido | Contexto |
+| --- | --- | --- |
+| ID candidato (CRC-32C plegado) | **5,2 ns** | por trama recibida (Nivel 1) |
+| ID candidato multiplicativo (*fallback*) | 8,3 ns | plataformas sin CRC-32C |
+| MAC LAA ↔ ID | **0,15 / 0,8 ns** | construir el destino / identificar el origen |
+| Filtro de destino en el maestro | **6,2 ns** | descarte temprano de tramas ajenas |
+| Backoff determinista (64 ranuras) | 7,4 ns | solo en admisión |
+| Admisión de un nodo nuevo | **62 ns** (\(O(1)\) amortizado) | fuera del superframe |
+| Reclamación de un nodo conocido | 10,6 ns | reinicio del nodo |
+| Búsqueda `{MAC → ID}` con 4096 nodos | 15,4 ns | tabla hash abierta |
+| Liberación explícita | ~620 ns | administrativa; recorre la tabla |
+
+**Nivel 1 frente a Nivel 2.** El ID candidato cuesta 5,2 ns y no contiene ramas
+ni bucles: el camino de recepción es de tiempo constante e independiente del
+número de nodos. Pero con 16 bits **no garantiza unicidad** (la paradoja del
+cumpleaños supera el 50 % hacia los ~300 nodos). Por eso el maestro mantiene la
+autoridad final: resuelve la colisión con un cursor secuencial **determinista** y
+solo en admisión, de modo que en régimen permanente los IDs son únicos.
+
+**Qué se gana.** La MAC local (`02:00:00:00:ID[15:8]:ID[7:0]`) es *unicast* y
+administrada localmente: el switch aprende la entrada CAM del nodo y conmuta
+**solo a su puerto**. Con el heartbeat (una trama de baja prioridad cada 60 s) la
+entrada no expira y desaparece el *flooding* de tramas desconocidas, que en redes
+densas multiplica el tráfico por el número de puertos. La tabla `{MAC → ID}` se
+persiste con reemplazo atómico para conservar la identidad tras un reinicio, una
+MAC clonada (misma MAC con distinto `nonce`) se rechaza, y el maestro indexa los
+nodos por hash de la MAC (1–2 comparaciones) en lugar de barrer la lista.
+
 ### Capacidad de la HAL
 
 | Operación | Resultado |
@@ -502,7 +538,7 @@ ctest --test-dir build --output-on-failure
 | Opción | Defecto | Descripción |
 | --- | --- | --- |
 | `CHRONOSRT_BUILD_PROTOCOLS` | `ON` | Compila EtherCAT y EtherTux |
-| `CHRONOSRT_BUILD_TESTS` | `ON` | Las 9 suites de `ctest` |
+| `CHRONOSRT_BUILD_TESTS` | `ON` | Las 10 suites de `ctest` |
 | `CHRONOSRT_BUILD_BENCHMARK` | `ON` | Ejecutable `chronosrt_bench` |
 | `CHRONOSRT_BUILD_TOOLS` | `ON` | Instala scripts de ayuda |
 | `CHRONOSRT_USE_SIMD` | `ON` | AVX-512 / AVX2 / NEON / SVE |
@@ -549,7 +585,8 @@ ctest --test-dir build --output-on-failure
 | `chronosrt_test_hwaccel` | 40 | CRC-32C, GF(2^8) y Reed-Solomon |
 | `chronosrt_test_ethertux` | 103 | Tramas, FEC, QoS/LAPM, planificador y maestro |
 | `chronosrt_test_ethertux_v010` | 152 | Cabecera v0.1.0, ET-ESM, ET-Sync, ET-WKC, ET-MBX, Flow Aggregator y FRM |
-| **Total** | **485** | **9/9 suites** |
+| `chronosrt_test_aalid` | 62 | ID local: MAC LAA, candidato, backoff, admisión, colisiones, clonado, expiración y persistencia |
+| **Total** | **547** | **10/10 suites** |
 
 `test_runner.sh` añade una auditoría del entorno adaptada al perfil de la placa
 (kernel, `cmdline`, *governor*, afinidad de IRQ y PHC de la interfaz) en modo

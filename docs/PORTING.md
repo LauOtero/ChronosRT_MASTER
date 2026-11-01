@@ -112,7 +112,7 @@ ctest --test-dir build --output-on-failure
 | Opción | Defecto | Descripción |
 |---|---|---|
 | `CHRONOSRT_BUILD_PROTOCOLS` | `ON` | Compila EtherCAT y EtherTux |
-| `CHRONOSRT_BUILD_TESTS` | `ON` | 9 suites de `ctest` |
+| `CHRONOSRT_BUILD_TESTS` | `ON` | 10 suites de `ctest` |
 | `CHRONOSRT_BUILD_BENCHMARK` | `ON` | Ejecutable `chronosrt_bench` |
 | `CHRONOSRT_BUILD_TOOLS` | `ON` | Instala scripts de ayuda |
 | `CHRONOSRT_USE_SIMD` | `ON` | AVX-512 / AVX2 / NEON / SVE |
@@ -232,6 +232,9 @@ sudo setcap cap_net_raw,cap_net_admin+ep ./build/chronosrt_bench
 - Si la NIC soporta PHC/Launch Time, `ChronosRT_hw_caps_for_interface()` lo
   reporta y `send_at()` aplica *pacing* por hardware.
 - `PACKET_TX_RING` se activa en modo `AUTO` si el kernel lo permite.
+- El ID local determinista añade **≈ 14,4 KB** de RAM (tabla de 256 nodos +
+  bitmap de 65 536 IDs) y no requiere privilegios; la persistencia necesita un
+  directorio escribible (p. ej. `/var/lib/chronosrt/`).
 
 ---
 
@@ -256,7 +259,8 @@ ctest --test-dir build --output-on-failure
 | `chronosrt_test_hwaccel` | 40 |
 | `chronosrt_test_ethertux` | 103 |
 | `chronosrt_test_ethertux_v010` | 152 |
-| **Total** | **485** |
+| `chronosrt_test_aalid` | 62 |
+| **Total** | **547** |
 
 ### 6.2 HAL
 
@@ -364,7 +368,8 @@ echo "@user - rtprio 99" | sudo tee -a /etc/security/limits.conf
 - [ ] `CAP_NET_RAW`/`CAP_NET_ADMIN` para el binario.
 - [ ] Nombre real de la interfaz verificado (`ip -br link`).
 - [ ] Protocolo elegido (`CHRONOSRT_PROTOCOL`).
-- [ ] `ctest` 9/9 y 485 aserciones.
+- [ ] `ctest` 10/10 y 547 aserciones.
+- [ ] `--mode aalid` con candidato < 10 ns y admisión < 100 ns (si usa ID local).
 - [ ] `--mode crc` con backend HW (o *fallback* aceptado).
 - [ ] `ChronosRT_kernel_probe()` con `support_level >= 2`.
 - [ ] Benchmark de referencia guardado para comparar regresiones.

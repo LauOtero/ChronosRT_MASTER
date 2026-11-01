@@ -163,6 +163,50 @@ con decodificación de **borrados** por eliminación gaussiana sobre GF(2^8)
 | Descubrimiento por broadcast | **Descubrimiento dirigido** + `DiscoveryReply` unicast |
 | Anillo/redundancia física | **FRM**: redundancia lógica de flujo con conmutación de camino |
 
+### 4.6 Identidad local determinista y supresión del *flooding*
+
+En una red con switches comerciales, una trama dirigida a una MAC no aprendida
+se **inunda a todos los puertos**, multiplicando el tráfico y añadiendo jitter a
+puertos que compiten por ancho de banda. Las entradas CAM expiran por
+envejecimiento (300 s típicos), así que el problema reaparece de forma periódica.
+
+La solución adoptada es una **identidad de 16 bits** codificada en una MAC
+administrada localmente:
+
+```
+0x02 : 0x00 : 0x00 : 0x00 : ID[15:8] : ID[7:0]
+```
+
+El bit U/L a 1 y el I/G a 0 la convierten en *unicast* local, de modo que el
+switch aprende la entrada y conmuta solo al puerto del nodo. Un *heartbeat* de
+baja prioridad (P5, una trama cada 60 s) mantiene viva la entrada de forma
+indefinida.
+
+El esquema tiene **dos niveles** con responsabilidades separadas:
+
+1. **Nivel 1 — receptor, camino crítico.** El ID candidato se deriva de la MAC
+   con CRC-32C plegado por XOR de mitades (5,2 ns medidos, sin ramas ni bucles).
+   El plegado importa: la truncación simple descarta la mitad alta del hash y
+   garantiza colisiones. Este nivel es un **filtro**, no un asignador.
+2. **Nivel 2 — maestro, solo admisión.** La paradoja del cumpleaños hace que con
+   16 bits aparezca una colisión con probabilidad > 50 % hacia los ~300 nodos
+   coexistente. El maestro mantiene `{MAC → ID}` y un bitmap de IDs, y resuelve
+   la colisión con un **cursor secuencial determinista** (sin `rand()` ni
+   temporizadores) fuera del superframe. El resultado es único en régimen
+   permanente.
+
+Complementos adoptados: *backoff* de admisión derivado del CRC de la MAC
+(reproducible y distinto entre nodos), rechazo de MAC clonada (misma MAC con
+distinto `nonce`), tiempo de gracia antes de liberar un ID sin *heartbeat* y
+persistencia atómica de la tabla para conservar la identidad tras un reinicio.
+
+La implementación usa una **tabla hash abierta** de 256 ranuras por defecto
+(potencia de 2) con estados *libre*/*activo*/*tombstone* y un bitmap de IDs
+ocupados: ≈ 14,4 KB en total. La búsqueda es O(1) media y la admisión O(1)
+amortizada; la liberación recorre la tabla (O(slots)) y queda fuera del
+superframe. El filtro de destino (6,2 ns) evita el parseo y la validación de
+CRC (138,6 ns con MTU) de las tramas dirigidas a otros nodos.
+
 ---
 
 ## 5. Aceleración por hardware
@@ -252,6 +296,10 @@ incompatible con tiempo real.
 | `qos_admit` | O(1) | O(1) | Token bucket |
 | `sched_window_at` | O(1) | O(1) | Aritmética modular |
 | `topology_on_frame` | O(1) | O(1) | Registro acotado (64 nodos) |
+| `aalid_candidate` | O(1) | O(1) | CRC-32C de 6 B plegado, sin ramas |
+| `aalid_admit` | O(1) amortizado | O(1) | Hash + cursor secuencial (solo admisión) |
+| `aalid_lookup` | O(1) medio | O(1) | Tabla hash abierta con sondeo acotado |
+| `aalid_release` | O(slots) | O(1) | Recorrido de la tabla (administrativa) |
 
 ### 7.2 Costes medidos (host AMD Ryzen 7 4800H, Linux 7.2.11)
 
@@ -265,6 +313,10 @@ incompatible con tiempo real.
 | Flow Aggregator 8×32 B | 48,0 ns |
 | Admisión QoS P2/576 B | 16,8 ns |
 | Ventana TDMA | 4,2 ns |
+| ID candidato (CRC-32C plegado) | 5,2 ns |
+| Filtro de destino del maestro | 6,2 ns |
+| Admisión de un nodo nuevo | 62 ns |
+| Búsqueda `{MAC → ID}` con 4096 nodos | 15,4 ns |
 
 Detalle completo en [BENCHMARKING.md](BENCHMARKING.md).
 
@@ -287,8 +339,9 @@ Detalle completo en [BENCHMARKING.md](BENCHMARKING.md).
 ## 9. Validación y metodología
 
 1. Build limpio `Release` en el host de referencia.
-2. `ctest` con **9 suites / 485 aserciones**.
-3. `chronosrt_bench --mode frame` y `--mode crc` para coste de CPU y HAL.
+2. `ctest` con **10 suites / 547 aserciones**.
+3. `chronosrt_bench --mode frame`, `--mode crc` y `--mode aalid` para coste de
+   CPU, HAL e identidad local.
 4. `rtla timerlat` / `cyclictest` en kernel PREEMPT_RT para latencia y jitter.
 5. Validación física de EtherCAT/EtherTux con `CAP_NET_RAW` y NIC dedicada
    (no disponible en el entorno de verificación).

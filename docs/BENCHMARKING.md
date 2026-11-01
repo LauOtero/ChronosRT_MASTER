@@ -1,6 +1,6 @@
 # Guía de Benchmarking — ChronosRT Master
 
-**Versión:** 0.1.0 · **Herramienta:** `chronosrt_bench` · **Suites:** 9 (`ctest`)
+**Versión:** 0.1.0 · **Herramienta:** `chronosrt_bench` · **Suites:** 10 (`ctest`)
 
 ## 1. Marco de métricas
 
@@ -12,6 +12,7 @@
 | WCET | Peor caso medido | `--mode wcet`, histograma (`chronosrt_rt.h`) |
 | Coste por trama | ns por construir/parsear | `--mode frame` |
 | CRC-32C | GB/s y tramas/s por backend | `--mode crc` |
+| ID local | ns del candidato, filtro y admisión | `--mode aalid` |
 | Cache/branch misses | `perf stat` | `perf stat …` |
 | Memoria | Ancho de banda, page faults | `perf stat`, `/proc/vmstat` |
 | Energía | Consumo | `powercap`/`turbostat` |
@@ -72,6 +73,7 @@ Ese aviso es esperado: el framework **no falla**, degrada y lo informa.
 | WCET | `--mode wcet` | Peor caso |
 | CRC | `--mode crc --duration S` | GB/s y tramas/s por backend |
 | Trama | `--mode frame` | Construir/parsear por trama, QoS y TDMA |
+| ID local | `--mode aalid` | ID candidato, filtro de destino y admisión (2 niveles) |
 
 Opciones: `--duration S`, `--threads N`, `--pool-size N`, `--hugepages`,
 `--no-simd`, `--no-affinity`, `--platform <rpi4|rpi5|jetson_nano|jetson_orin|intel_nuc|orange_pi5|rock5b|x86_64_rt>`.
@@ -200,6 +202,51 @@ En ARMv8.1+ se usa `crc32c*`; en la Banana Pi M2 Zero (Cortex-A7) se cae al
 El límite práctico es el **enlace**, no la CPU. Para maximizar tramas/s use
 tramas pequeñas en el plano de control y reserve el MTU para datos.
 
+### 5.2 Medición del ID local (`--mode aalid`)
+
+Nivel 1 (camino crítico de recepción) y Nivel 2 (admisión), medidos con
+`chronosrt_bench --mode aalid` en el mismo host:
+
+```
+Nivel 1 (camino crítico de recepción):
+  ID candidato (CRC-32C plegado)                5.21 ns
+  ID candidato (multiplicativo)                 8.25 ns
+  MAC local <- ID (LAA)                         0.15 ns
+  ID del origen a partir de la MAC              0.79 ns
+  backoff determinista (64 slots)               7.44 ns
+
+Nivel 2 (admisión, fuera del superframe):
+  admisión de un nodo nuevo (4096 altas)       62.4 ns
+  reclamación de un nodo conocido             10.59 ns
+  búsqueda {MAC -> ID} con 4096 nodos         15.39 ns
+  ciclo admisión + liberación explícita    623.37 ns
+
+Filtro del maestro:
+  filtro de destino (unicast propio)            6.20 ns
+```
+
+| Operación | Coste | Lectura |
+|---|---:|---|
+| ID candidato (CRC-32C) | 5,2 ns | tiempo constante, sin ramas ni bucles |
+| *Fallback* multiplicativo | 8,3 ns | plataformas sin CRC-32C |
+| Filtro de destino del maestro | 6,2 ns | descarte antes de parsear y validar el CRC |
+| Admisión de nodo nuevo | 62 ns | O(1) amortizado; solo en admisión |
+| Búsqueda `{MAC → ID}` | 15,4 ns | tabla hash abierta, independiente del número de nodos |
+| Ciclo admisión + liberación | ~620 ns | recorre la tabla; operación administrativa |
+
+El Nivel 1 **no garantiza unicidad**: con 16 bits la paradoja del cumpleaños
+supera el 50 % hacia los ~300 nodos. La unicidad la aporta el Nivel 2, que se
+ejecuta fuera del superframe.
+
+**Lectura práctica.** El filtro de destino cuesta 6,2 ns y descarta antes de
+parsear; una trama ajena de MTU habría costado **138,6 ns** de parseo y
+validación de CRC (§4). En un segmento con varios nodos, el ahorro es
+proporcional al tráfico ajeno que el switch entregue al puerto.
+
+> En rutas de pocos nanosegundos la dispersión entre ejecuciones es de ±10 %:
+> candidato **4,8–5,2 ns**, admisión **62–66 ns**, búsqueda **14–15 ns** y ciclo
+> admisión + liberación **610–625 ns**.
+
 ---
 
 ## 6. Scripts de automatización
@@ -320,7 +367,7 @@ echo "=== Validación ChronosRT ==="
 
 # 1. Suites
 if ctest --test-dir build --output-on-failure >/tmp/ctest.log 2>&1; then
-    echo "[PASS] ctest 9/9"
+    echo "[PASS] ctest 10/10"
 else
     echo "[FAIL] ctest"
     PASS=false
@@ -390,7 +437,7 @@ plataforma con el procedimiento de §2.
 OUT="reports/$(date +%Y%m%d)"
 mkdir -p "$OUT"
 
-for mode in latency throughput jitter stress wcet frame crc; do
+for mode in latency throughput jitter stress wcet frame crc aalid; do
     echo "Ejecutando $mode..."
     ./build/chronosrt_bench --mode="$mode" --duration=60 > "$OUT/$mode.txt" 2>&1
 done
@@ -430,6 +477,7 @@ ctest --test-dir build --output-on-failure
 | `chronosrt_test_hwaccel` | 40 |
 | `chronosrt_test_ethertux` | 103 |
 | `chronosrt_test_ethertux_v010` | 152 |
-| **Total** | **485** |
+| `chronosrt_test_aalid` | 62 |
+| **Total** | **547** |
 
-Estado del host de referencia: **9/9 suites, 100 %**, en 0,06 s.
+Estado del host de referencia: **10/10 suites, 100 %**, en 0,08 s.
