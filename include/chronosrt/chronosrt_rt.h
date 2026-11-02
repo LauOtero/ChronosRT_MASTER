@@ -25,12 +25,17 @@ extern "C" {
 typedef struct {
     uint64_t bucket_ns;                       /* ancho de bucket en ns */
     uint64_t buckets[CHRONOSRT_HIST_BUCKETS];
+    uint64_t prefix_sum[CHRONOSRT_HIST_BUCKETS]; /* prefix-sum incremental (B-7) */
     uint64_t count;
     uint64_t sum_ns;
     uint64_t sum_sq_ns;
     uint64_t min_ns;
     uint64_t max_ns;
     uint64_t overflow;                        /* muestras por encima del rango */
+    bool     prefix_sum_valid;               /* cache válida para búsqueda O(log n) */
+    /* Recíproco para dividir por `bucket_ns` sin `idiv` (I+D+i: el registro
+     * ocurre una vez por muestra y el divisor es variable en runtime). */
+    uint64_t bucket_recip;
 } ChronosRT_hist_t;
 
 CHRONOSRT_API void     ChronosRT_hist_init(ChronosRT_hist_t* h, uint64_t bucket_ns);
@@ -39,7 +44,7 @@ CHRONOSRT_API void     ChronosRT_hist_record(ChronosRT_hist_t* h, uint64_t laten
 CHRONOSRT_API uint64_t ChronosRT_hist_count(const ChronosRT_hist_t* h);
 CHRONOSRT_API uint64_t ChronosRT_hist_mean_ns(const ChronosRT_hist_t* h);
 CHRONOSRT_API uint64_t ChronosRT_hist_stddev_ns(const ChronosRT_hist_t* h);
-CHRONOSRT_API uint64_t ChronosRT_hist_percentile_ns(const ChronosRT_hist_t* h, double p);
+CHRONOSRT_API uint64_t ChronosRT_hist_percentile_ns(ChronosRT_hist_t* h, double p);
 CHRONOSRT_API uint64_t ChronosRT_hist_wcet_ns(const ChronosRT_hist_t* h);
 CHRONOSRT_API uint64_t ChronosRT_hist_best_ns(const ChronosRT_hist_t* h);
 CHRONOSRT_API void     ChronosRT_hist_print(const ChronosRT_hist_t* h, const char* label);

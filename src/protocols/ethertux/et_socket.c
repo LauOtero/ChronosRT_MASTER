@@ -36,6 +36,10 @@
 #include <linux/if_ether.h>
 #include <linux/net_tstamp.h>
 
+#if defined(__x86_64__)
+    #include <immintrin.h>
+#endif
+
 static uint64_t et_now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -119,6 +123,22 @@ ChronosRT_status_t et_socket_open(et_port_t* port, const char* ifname) {
     }
 #endif
 
+    /*
+     * Recepción de baja latencia: sondeo ocupado acotado en el propio driver
+     * (`SO_BUSY_POLL`) en lugar de dormir hasta el siguiente tick del kernel.
+     * Si el kernel o el driver no lo soportan, se ignora.
+     */
+#ifdef SO_BUSY_POLL
+    int busy_us = 25;
+    (void)setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &busy_us, sizeof(busy_us));
+#endif
+#ifdef SO_PREFER_BUSY_POLL
+    int prefer = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &prefer, sizeof(prefer));
+#endif
+    int rcvbuf = 1 << 20;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
     port->fd = fd;
     port->ifindex = (int)ifindex;
     strncpy(port->ifname, ifname, sizeof(port->ifname) - 1);
@@ -164,6 +184,12 @@ bool et_socket_tx_ring_enable(et_port_t* port, uint32_t frames) {
     if (frames > 2048u) {
         frames = 2048u;
     }
+    /* Potencia de dos: `claim` indexa con máscara, sin división por ranura. */
+    uint32_t pow2 = 8u;
+    while (pow2 < frames) {
+        pow2 <<= 1u;
+    }
+    frames = pow2;
 
     /* Dos tramas por bloque de 4 KiB (block_size debe ser múltiplo de página). */
     const uint32_t per_block  = 2u;
@@ -191,7 +217,9 @@ bool et_socket_tx_ring_enable(et_port_t* port, uint32_t frames) {
     port->tx_ring_bytes  = (size_t)block_size * (size_t)block_nr;
     port->tx_frame_size  = ET_TX_RING_FRAME_BYTES;
     port->tx_frame_nr    = req.tp_frame_nr;
+    port->tx_frame_mask  = req.tp_frame_nr - 1u;
     port->tx_head        = 0u;
+    port->tx_reserved    = false;
     port->tx_ring_active = true;
     return true;
 }
@@ -215,19 +243,67 @@ void et_socket_tx_ring_disable(et_port_t* port) {
     port->tx_ring_active = false;
 }
 
-/* Reserva la siguiente ranura libre del anillo (NULL si están todas en vuelo). */
+/* Reserva la siguiente ranura libre del anillo (NULL si están todas en vuelo).
+ * Prefetchea la siguiente ranura mientras se evalúa la actual (B-7). */
 static uint8_t* et_ring_claim(et_port_t* port) {
     for (uint32_t n = 0; n < port->tx_frame_nr; n++) {
         const uint32_t idx = port->tx_head;
+        const uint32_t next_idx = (idx + 1u) & port->tx_frame_mask;
         uint8_t* slot = port->tx_ring + (size_t)idx * port->tx_frame_size;
         struct tpacket_hdr* h = (struct tpacket_hdr*)(void*)slot;
 
-        port->tx_head = (idx + 1u) % port->tx_frame_nr;
+        /* Prefetch de la siguiente ranura para reducir cache miss en la siguiente iteración. */
+#if defined(__x86_64__)
+        _mm_prefetch((const char*)(port->tx_ring + (size_t)next_idx * port->tx_frame_size), _MM_HINT_T0);
+#elif defined(__aarch64__)
+        __builtin_prefetch(port->tx_ring + (size_t)next_idx * port->tx_frame_size, 1, 3);
+#endif
+
+        port->tx_head = next_idx;
         if (h->tp_status == TP_STATUS_AVAILABLE) {
             return slot;
         }
     }
     return NULL;
+}
+
+/*
+ * Reserva/confirma: el llamador construye la trama DIRECTAMENTE en la ranura del
+ * anillo (cabecera Ethernet + PDU + CRC), sin el memcpy final del camino `put`.
+ */
+static void et_ring_commit(et_port_t* port, uint8_t* slot, uint32_t len);
+
+uint8_t* et_socket_tx_reserve(et_port_t* port) {
+    if (port == NULL || !port->tx_ring_active || port->tx_reserved) {
+        return NULL;
+    }
+    uint8_t* slot = et_ring_claim(port);
+    if (slot == NULL) {
+        (void)et_socket_tx_ring_kick(port);
+        slot = et_ring_claim(port);
+        if (slot == NULL) {
+            return NULL;
+        }
+    }
+    port->tx_reserved = true;
+    return slot + TPACKET_HDRLEN;
+}
+
+void et_socket_tx_commit(et_port_t* port, uint32_t len) {
+    if (port == NULL || !port->tx_reserved) {
+        return;
+    }
+    uint8_t* slot = port->tx_ring +
+                    (size_t)((port->tx_head - 1u) & port->tx_frame_mask) * port->tx_frame_size;
+    et_ring_commit(port, slot, len);
+    port->tx_reserved = false;
+}
+
+/* Descarta una reserva sin enviarla: la ranura sigue AVAILABLE para reutilizarse. */
+void et_socket_tx_cancel(et_port_t* port) {
+    if (port != NULL) {
+        port->tx_reserved = false;
+    }
 }
 
 static void et_ring_commit(et_port_t* port, uint8_t* slot, uint32_t len) {
@@ -247,13 +323,27 @@ int et_socket_tx_ring_put(et_port_t* port, const uint8_t* frame, uint32_t len) {
     if ((size_t)len + (size_t)TPACKET_HDRLEN > port->tx_frame_size) {
         return -1;
     }
-    uint8_t* slot = et_ring_claim(port);
-    if (slot == NULL) {
-        return -1;   /* anillo lleno: falta kick */
+
+    /* Backpressure con spin-wait: si el anillo está lleno, kick y reintentar
+     * con spin corto antes que fallar. Evita saltos bruscos de throughput. */
+    for (uint32_t attempt = 0; attempt < 4u; attempt++) {
+        uint8_t* slot = et_ring_claim(port);
+        if (slot != NULL) {
+            memcpy(slot + TPACKET_HDRLEN, frame, len);
+            et_ring_commit(port, slot, len);
+            return 0;
+        }
+        /* Anillo lleno: liberar ranuras en vuelo y reintentar. */
+        (void)et_socket_tx_ring_kick(port);
+        for (volatile int spin = 0; spin < 64; spin++) {
+#if defined(__x86_64__)
+            __asm__ __volatile__("pause" : : : "memory");
+#elif defined(__aarch64__)
+            __asm__ __volatile__("yield" : : : "memory");
+#endif
+        }
     }
-    memcpy(slot + TPACKET_HDRLEN, frame, len);
-    et_ring_commit(port, slot, len);
-    return 0;
+    return -1;
 }
 
 int et_socket_tx_ring_kick(et_port_t* port) {
@@ -489,6 +579,27 @@ int et_socket_recv(et_port_t* port, uint8_t* frame, uint32_t bufsize,
     uint64_t deadline = et_now_us() + (uint64_t)timeout_us;
 
     for (;;) {
+        /*
+         * Camino rápido: si ya hay una trama en el socket, un único `recv`
+         * (sin `poll`) evita la mitad de las llamadas al sistema por trama.
+         */
+        ssize_t n = recv(port->fd, frame, bufsize, MSG_DONTWAIT);
+        if (n >= (ssize_t)(ChronosRT_ET_ETH_HDR_SIZE + ChronosRT_ET_HEADER_SIZE)) {
+            uint16_t eth_type = (uint16_t)((frame[12] << 8) | frame[13]);
+            if (eth_type == ChronosRT_ET_ETHERTYPE) {
+                port->frames_rx++;
+                port->bytes_rx += (uint32_t)n;
+                return (int)n;
+            }
+            continue;   /* ajena: sigue drenando */
+        }
+        if (n >= 0) {
+            continue;   /* trama corta: descártala y sigue */
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            return -1;
+        }
+
         uint64_t now = et_now_us();
         if (now >= deadline) {
             return -1;
@@ -517,17 +628,5 @@ int et_socket_recv(et_port_t* port, uint8_t* frame, uint32_t bufsize,
         if ((pfd.revents & POLLIN) == 0) {
             continue;
         }
-
-        ssize_t n = recv(port->fd, frame, bufsize, 0);
-        if (n < (ssize_t)(ChronosRT_ET_ETH_HDR_SIZE + ChronosRT_ET_HEADER_SIZE)) {
-            continue;   /* trama corta: descártala */
-        }
-        uint16_t eth_type = (uint16_t)((frame[12] << 8) | frame[13]);
-        if (eth_type != ChronosRT_ET_ETHERTYPE) {
-            continue;
-        }
-        port->frames_rx++;
-        port->bytes_rx += (uint32_t)n;
-        return (int)n;
     }
 }

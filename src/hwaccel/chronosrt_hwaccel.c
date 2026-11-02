@@ -15,6 +15,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <time.h>
@@ -108,18 +109,17 @@ static uint32_t        s_crc_tab[8][256];
 static pthread_once_t  s_crc_once = PTHREAD_ONCE_INIT;
 
 /* Tablas de "skip" para el CRC multistream: avanzan el estado por la distancia
- * fija entre flujos, de modo que la combinación cuesta 8 lecturas de L1. */
-#if CRT_X86
-static uint32_t        s_skip8[8][16];
+ * fija entre flujos, de modo que la combinación cuesta 8 lecturas de L1.
+ * Se construyen en las DOS arquitecturas: el esquema de 4 flujos es genérico. */
 static uint32_t        s_skip16[8][16];
-static uint32_t        s_skip24[8][16];
 static uint32_t        s_skip32[8][16];
+static uint32_t        s_skip48[8][16];
 static uint32_t        s_skip64[8][16];
 static uint32_t        s_skip96[8][16];
 static uint32_t        s_skip128[8][16];
+static uint32_t        s_skip192[8][16];
 static uint32_t        s_skip256[8][16];
 static uint32_t        s_skip384[8][16];
-#endif
 
 static void crc_init(void) {
     for (uint32_t i = 0; i < 256u; i++) {
@@ -137,7 +137,6 @@ static void crc_init(void) {
     }
 }
 
-#if CRT_X86
 /* Avanza el estado CRC-32C (crudo) por `n` bytes cero. */
 static uint32_t crc_advance_bytes(uint32_t crc, size_t n) {
     while (n-- > 0u) {
@@ -171,7 +170,6 @@ static inline uint32_t crc_skip(uint32_t crc, const uint32_t tab[8][16]) {
          ^ tab[4][(crc >> 16) & 0xFu] ^ tab[5][(crc >> 20) & 0xFu]
          ^ tab[6][(crc >> 24) & 0xFu] ^ tab[7][(crc >> 28) & 0xFu];
 }
-#endif
 
 uint32_t ChronosRT_crc32c_sw_raw(uint32_t seed, const void* data, size_t len) {
     (void)pthread_once(&s_crc_once, crc_init);
@@ -210,31 +208,60 @@ uint32_t ChronosRT_crc32c_sw(const void* data, size_t len) {
 /* CRC-32C por instrucción                                            */
 /* ================================================================== */
 
-#if CRT_X86
+/* ================================================================== */
+/* CRC-32C por instrucción (4 flujos, x86-64 y ARMv8)                 */
+/* ================================================================== */
+
 /*
- * CRC-32C con la instrucción CRC32 en CUATRO flujos independientes.
- *
- * `crc32 r64` tiene 1/ciclo de throughput y ~3 ciclos de latencia: un único
- * flujo está limitado a 8 B / 3 ciclos ≈ 2,7 B/ciclo. Con cuatro cadenas
- * independientes se oculta por completo la latencia y se satura el puerto de
+ * `crc32 r64` / `crc32cd` tienen 1/ciclo de throughput y ~3 ciclos de latencia:
+ * un único flujo está limitado a 8 B / 3 ciclos ≈ 2,7 B/ciclo. Con cuatro
+ * cadenas independientes se oculta la latencia y se satura el puerto de
  * ejecución (8 B/ciclo), que es el techo de la instrucción.
  *
+ * El mismo esquema se aplica en ARMv8.1: antes la ruta ARM era de un solo flujo
+ * (~2,7 B/ciclo), por lo que esta parte multiplica por ~3 el CRC en las SBC.
+ *
  * Los flujos se combinan con tablas de salto (8 lecturas de L1 por combinar):
- * el coste de combinación es fijo y amortizable frente a 128 B de datos.
+ * el coste es fijo y se amortiza frente a 64–512 B de datos. Por debajo de 64 B
+ * NO se usa multistream: las tablas cuestan más que la propia cadena.
  */
-/*
- * Un "tier": cuatro flujos de `blk` bytes cada uno (4·blk bytes por iteración).
- * Cuatro cadenas independientes ocultan por completo la latencia de `crc32` y
- * dejan el bucle limitado por el throughput de la instrucción (medido ~2× más
- * rápido que con tres flujos en Zen 2).
- * Las tablas reciben las distancias blk, 2·blk y 3·blk para reincorporar los
- * flujos 2, 1 y 0 al flujo 3, que es el que queda en el estado.
- */
-__attribute__((target("sse4.2")))
-static inline uint32_t crc32c_x86_x4_tier(uint32_t l, const uint8_t* p, size_t blk,
-                                          const uint32_t t1[8][16],
-                                          const uint32_t t2[8][16],
-                                          const uint32_t t3[8][16]) {
+#if CRT_X86
+  #define CRC_ACC64(acc, v) ((uint32_t)_mm_crc32_u64((acc), (v)))
+  #define CRC_ACC8(acc, b)  ((uint32_t)_mm_crc32_u8((acc), (b)))
+  #define CRC_TARGET        __attribute__((target("sse4.2")))
+  #define CRC_HW_AVAILABLE  1
+#elif CRT_ARM64
+  #define CRC_ACC64(acc, v) ((uint32_t)__crc32cd((acc), (v)))
+  #define CRC_ACC8(acc, b)  ((uint32_t)__crc32cb((acc), (b)))
+  #define CRC_TARGET        __attribute__((target("+crc")))
+  #define CRC_HW_AVAILABLE  1
+#else
+  #define CRC_HW_AVAILABLE  0
+#endif
+
+#if CRC_HW_AVAILABLE
+/* Cadena única: óptima para cargas pequeñas (< 64 B). */
+CRC_TARGET
+static inline uint32_t crc_hw_chain(uint32_t l, const uint8_t* p, size_t len) {
+    while (len >= 8u) {
+        uint64_t v;
+        memcpy(&v, p, sizeof(v));
+        l = CRC_ACC64(l, v);
+        p += 8u;
+        len -= 8u;
+    }
+    while (len-- > 0u) {
+        l = CRC_ACC8(l, *p++);
+    }
+    return l;
+}
+
+/* Un "tier": cuatro flujos de `blk` bytes cada uno (4·blk por iteración). */
+CRC_TARGET
+static inline uint32_t crc_hw_x4_tier(uint32_t l, const uint8_t* p, size_t blk,
+                                      const uint32_t t1[8][16],
+                                      const uint32_t t2[8][16],
+                                      const uint32_t t3[8][16]) {
     uint32_t l1 = 0u;
     uint32_t l2 = 0u;
     uint32_t l3 = 0u;
@@ -248,68 +275,41 @@ static inline uint32_t crc32c_x86_x4_tier(uint32_t l, const uint8_t* p, size_t b
         memcpy(&v1, p1 + i, sizeof(v1));
         memcpy(&v2, p2 + i, sizeof(v2));
         memcpy(&v3, p3 + i, sizeof(v3));
-        l  = (uint32_t)_mm_crc32_u64(l,  v0);
-        l1 = (uint32_t)_mm_crc32_u64(l1, v1);
-        l2 = (uint32_t)_mm_crc32_u64(l2, v2);
-        l3 = (uint32_t)_mm_crc32_u64(l3, v3);
+        l  = CRC_ACC64(l,  v0);
+        l1 = CRC_ACC64(l1, v1);
+        l2 = CRC_ACC64(l2, v2);
+        l3 = CRC_ACC64(l3, v3);
     }
     return crc_skip(l, t3) ^ crc_skip(l1, t2) ^ crc_skip(l2, t1) ^ l3;
 }
 
-__attribute__((target("sse4.2")))
-static uint32_t crc32c_x86_x4(uint32_t seed, const void* data, size_t len) {
+CRC_TARGET
+static uint32_t crc_hw_x4(uint32_t seed, const void* data, size_t len) {
     const uint8_t* p = (const uint8_t*)data;
     uint32_t l = seed;
 
-    /* 512 B por iteración: 4 flujos de 128 B (combinaciones despreciables). */
+    /* Se elige el tier mayor posible: menos combinaciones por byte. */
     while (len >= 512u) {
-        l = crc32c_x86_x4_tier(l, p, 128u, s_skip128, s_skip256, s_skip384);
+        l = crc_hw_x4_tier(l, p, 128u, s_skip128, s_skip256, s_skip384);
         p += 512u;
         len -= 512u;
     }
-    /* 128 B: 4 flujos de 32 B. */
+    while (len >= 256u) {
+        l = crc_hw_x4_tier(l, p, 64u, s_skip64, s_skip128, s_skip192);
+        p += 256u;
+        len -= 256u;
+    }
     while (len >= 128u) {
-        l = crc32c_x86_x4_tier(l, p, 32u, s_skip32, s_skip64, s_skip96);
+        l = crc_hw_x4_tier(l, p, 32u, s_skip32, s_skip64, s_skip96);
         p += 128u;
         len -= 128u;
     }
-    /* 32 B: 4 flujos de 8 B (tramas pequeñas). */
-    while (len >= 32u) {
-        l = crc32c_x86_x4_tier(l, p, 8u, s_skip8, s_skip16, s_skip24);
-        p += 32u;
-        len -= 32u;
+    while (len >= 64u) {
+        l = crc_hw_x4_tier(l, p, 16u, s_skip16, s_skip32, s_skip48);
+        p += 64u;
+        len -= 64u;
     }
-    while (len >= 8u) {
-        uint64_t v;
-        memcpy(&v, p, sizeof(v));
-        l = (uint32_t)_mm_crc32_u64(l, v);
-        p += 8u;
-        len -= 8u;
-    }
-    while (len-- > 0u) {
-        l = _mm_crc32_u8(l, *p++);
-    }
-    return l;
-}
-#endif
-
-
-#if CRT_ARM64
-__attribute__((target("+crc")))
-static uint32_t crc32c_arm_raw(uint32_t seed, const void* data, size_t len) {
-    const uint8_t* p = (const uint8_t*)data;
-    uint32_t crc = seed;
-    while (len >= 8u) {
-        uint64_t v;
-        memcpy(&v, p, sizeof(v));
-        crc = __crc32cd(crc, v);
-        p += 8;
-        len -= 8u;
-    }
-    while (len-- > 0u) {
-        crc = __crc32cb(crc, *p++);
-    }
-    return crc;
+    return crc_hw_chain(l, p, len);
 }
 #endif
 
@@ -434,19 +434,21 @@ typedef struct {
 
 /* Envoltorio sin atributos de destino: el registro guarda un puntero genérico y
  * la llamada indirecta no arrastra requisitos de ISA al llamador. */
-#if CRT_X86
-static uint32_t crc_be_x4(uint32_t s, const void* d, size_t n) {
-    return crc32c_x86_x4(s, d, n);
+#if CRC_HW_AVAILABLE
+static uint32_t crc_be_hw(uint32_t s, const void* d, size_t n) {
+    return crc_hw_x4(s, d, n);
 }
+#endif
 
+#if CRT_X86
 static crc_backend_entry_t s_crc_backends[] = {
-    { "sse4.2-x4",    crc_be_x4,          false },
+    { "sse4.2-x4",    crc_be_hw,              false },
     { "slice-by-8",   ChronosRT_crc32c_sw_raw, true },
 };
 #elif CRT_ARM64
 static crc_backend_entry_t s_crc_backends[] = {
-    { "armv8-crc",   crc32c_arm_raw,      false },
-    { "slice-by-8",  ChronosRT_crc32c_sw_raw, true },
+    { "armv8-crc",    crc_be_hw,              false },
+    { "slice-by-8",   ChronosRT_crc32c_sw_raw, true },
 };
 #else
 static crc_backend_entry_t s_crc_backends[] = {
@@ -474,7 +476,10 @@ static crc_backend_entry_t* crc_backend_find(const char* name) {
  * reproduce exactamente el CRC-32C esperado en ESTA CPU.
  */
 static bool crc_backend_verify(crc_raw_fn fn) {
-    static const size_t   lens[]  = { 64u, 128u, 192u, 256u, 320u, 1024u, 1500u };
+    /* Incluye longitudes pequeñas: la ruta adaptativa cambia de estrategia en
+     * 64/128/256 B y todas deben dar el mismo CRC que la referencia. */
+    static const size_t   lens[]  = { 1u, 3u, 7u, 8u, 16u, 31u, 32u, 48u, 60u, 63u, 64u,
+                                      65u, 127u, 128u, 192u, 256u, 320u, 1024u, 1500u };
     static const uint32_t seeds[] = { 0u, 0xFFFFFFFFu, 0x12345678u };
     uint8_t buf[1536];
     uint32_t x = 0x9E3779B9u;
@@ -508,21 +513,23 @@ static void caps_init(void) {
     s_caps.crc32c_backend = "slice-by-8";
     s_caps.fec_backend    = "scalar";
 
-    /* Las tablas SW también son la base de las tablas de salto multistream. */
+    /* Las tablas SW también son la base de las tablas de salto multistream.
+     * El esquema de 4 flujos se usa en x86-64 y ARMv8, así que las tablas se
+     * construyen siempre (son ~9 KiB de L1 y ahorran el `idiv` del skip). */
     (void)pthread_once(&s_crc_once, crc_init);
     atomic_store_explicit(&s_crc_raw_fn, ChronosRT_crc32c_sw_raw, memory_order_relaxed);
 
-#if CRT_X86
-    crc_build_skip(s_skip8, 8u);
     crc_build_skip(s_skip16, 16u);
-    crc_build_skip(s_skip24, 24u);
     crc_build_skip(s_skip32, 32u);
+    crc_build_skip(s_skip48, 48u);
     crc_build_skip(s_skip64, 64u);
     crc_build_skip(s_skip96, 96u);
     crc_build_skip(s_skip128, 128u);
+    crc_build_skip(s_skip192, 192u);
     crc_build_skip(s_skip256, 256u);
     crc_build_skip(s_skip384, 384u);
 
+#if CRT_X86
     cpu_detect_x86(&s_caps);
 
     if (s_caps.isa_avx2) {
@@ -530,17 +537,21 @@ static void caps_init(void) {
         s_caps.fec_backend = "avx2";
     }
 
-    /* Escalón 1: instrucción CRC32 en cuatro flujos (siempre correcto). */
+    /* Instrucción CRC32 en cuatro flujos (verificada contra la referencia). */
     if (s_caps.isa_sse42) {
         crc_backend_find("sse4.2-x4")->available = true;
-        crc_activate("sse4.2-x4", crc_be_x4);
+        if (crc_backend_verify(crc_be_hw)) {
+            crc_activate("sse4.2-x4", crc_be_hw);
+        }
     }
 
 #elif CRT_ARM64
     unsigned long hwcap = getauxval(AT_HWCAP);
     if ((hwcap & (unsigned long)HWCAP_CRC32) != 0UL) {
         crc_backend_find("armv8-crc")->available = true;
-        crc_activate("armv8-crc", crc32c_arm_raw);
+        if (crc_backend_verify(crc_be_hw)) {
+            crc_activate("armv8-crc", crc_be_hw);
+        }
     }
     /* NEON es obligatorio en AArch64: el FEC siempre se vectoriza. */
     s_caps.fec_simd    = true;
@@ -970,10 +981,144 @@ ChronosRT_status_t ChronosRT_rs_decode(uint8_t k, uint8_t n,
 /* Timestamping                                                       */
 /* ================================================================== */
 
-uint64_t ChronosRT_tx_timestamp_ns(void) {
+/*
+ * Reloj de dominio rápido (I-3). `clock_gettime(CLOCK_MONOTONIC)` cuesta
+ * 20–25 ns (vDSO) y se llama una vez por evento y por trama. Cuando el kernel
+ * ya deriva CLOCK_MONOTONIC del mismo contador (clocksource `tsc` en x86,
+ * `arch_sys_counter` en ARM), se puede leer el contador directamente:
+ *
+ *     ns = base_ns + (counter - base_counter) * ns_per_cycle
+ *
+ * Se calibra una sola vez (50 ms) y queda publicado en variables atómicas
+ * escritas antes de activar `s_clock_fast`; los lectores solo hacen una carga
+ * relaxed. Si la plataforma no cumple las condiciones, se usa `clock_gettime`.
+ */
+static _Atomic uint64_t s_clock_base_ns  = 0;
+static _Atomic uint64_t s_clock_base_cyc = 0;
+static _Atomic uint64_t s_clock_ns_q32   = 0;   /* ns/ciclo × 2^32 */
+static _Atomic int      s_clock_fast     = -1;  /* -1 sin decidir, 0 no, 1 sí */
+static pthread_once_t   s_clock_once     = PTHREAD_ONCE_INIT;
+
+static inline uint64_t hw_read_counter(void) {
+#if defined(__x86_64__)
+    uint32_t lo, hi;
+    /* rdtsc sin lfence: el compilador no reordena la lectura respecto a los
+     * accesos del mismo hilo con la barrera de compilador de abajo. */
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+#elif defined(__aarch64__)
+    uint64_t v;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+static uint64_t hw_monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* ¿El kernel calcula CLOCK_MONOTONIC con el mismo contador que leemos? */
+static bool hw_clocksource_matches(void) {
+    const char* want =
+#if defined(__x86_64__)
+        "tsc";
+#elif defined(__aarch64__)
+        "arch_sys_counter";
+#else
+        "";
+#endif
+    if (want[0] == '\0') {
+        return false;
+    }
+    FILE* fp = fopen("/sys/devices/system/clocksource/clocksource0/current_clocksource", "r");
+    if (!fp) {
+        return false;
+    }
+    char buf[64] = {0};
+    const size_t got = fread(buf, 1, sizeof(buf) - 1u, fp);
+    (void)fclose(fp);
+    if (got == 0u) {
+        return false;
+    }
+    return strncmp(buf, want, strlen(want)) == 0;
+}
+
+static void clock_init(void) {
+    atomic_store_explicit(&s_clock_fast, 0, memory_order_relaxed);
+
+    /* Escape hatch: permite forzar la ruta lenta (depuración o plataformas
+     * con TSC poco fiable). */
+    const char* off = getenv("CHRONOSRT_NO_FAST_CLOCK");
+    if (off != NULL && off[0] != '\0' && off[0] != '0') {
+        return;
+    }
+
+    const bool source_matches = hw_clocksource_matches();
+
+#if defined(__x86_64__)
+    /* TSC invariante (CPUID.80000007H:EDX[8]). Aunque el kernel prefiera otro
+     * clocksource (p. ej. `hpet` en una VM), el TSC sigue siendo un contador
+     * monótono de frecuencia fija y se calibra contra CLOCK_MONOTONIC. En un
+     * arranque nativo el clocksource suele ser `tsc` y el error es cero. */
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    __asm__ __volatile__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                                 : "a"(0x80000007u), "c"(0));
+    const bool tsc_invariant = (edx & (1u << 8)) != 0u;
+    if (!source_matches && !tsc_invariant) {
+        return;
+    }
+#else
+    if (!source_matches) {
+        return;
+    }
+#endif
+
+    /* Calibración: 50 ms miden el ratio con error relativo < 1 ppm. */
+    const uint64_t c0 = hw_read_counter();
+    const uint64_t t0 = hw_monotonic_ns();
+    uint64_t t1 = t0;
+    while (t1 - t0 < 50000000ULL) {
+        t1 = hw_monotonic_ns();
+    }
+    const uint64_t c1 = hw_read_counter();
+    const uint64_t cyc = c1 - c0;
+    if (cyc < 1000u || t1 <= t0) {
+        return;
+    }
+
+    const uint64_t span = t1 - t0;
+    /* q32 = span * 2^32 / cyc, en 128 bits para no desbordar. */
+    const uint64_t q32 = (uint64_t)(((__uint128_t)span << 32) / cyc);
+    if (q32 == 0u) {
+        return;
+    }
+
+    atomic_store_explicit(&s_clock_base_ns, t0, memory_order_relaxed);
+    atomic_store_explicit(&s_clock_base_cyc, c0, memory_order_relaxed);
+    atomic_store_explicit(&s_clock_ns_q32, q32, memory_order_relaxed);
+    atomic_store_explicit(&s_clock_fast, 1, memory_order_release);
+}
+
+uint64_t ChronosRT_tx_timestamp_ns(void) {
+    int fast = atomic_load_explicit(&s_clock_fast, memory_order_acquire);
+    if (__builtin_expect(fast < 0, 0)) {
+        (void)pthread_once(&s_clock_once, clock_init);
+        fast = atomic_load_explicit(&s_clock_fast, memory_order_acquire);
+    }
+    if (__builtin_expect(fast == 1, 1)) {
+        const uint64_t cyc   = hw_read_counter();
+        const uint64_t base  = atomic_load_explicit(&s_clock_base_cyc, memory_order_relaxed);
+        const uint64_t q32   = atomic_load_explicit(&s_clock_ns_q32, memory_order_relaxed);
+        const uint64_t ns0   = atomic_load_explicit(&s_clock_base_ns, memory_order_relaxed);
+        return ns0 + (uint64_t)(((__uint128_t)(cyc - base) * q32) >> 32);
+    }
+    return hw_monotonic_ns();
 }
 
 /* ================================================================== */

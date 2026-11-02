@@ -104,6 +104,9 @@ typedef struct ChronosRT_CACHE_ALIGNED {
 } ChronosRT_metrics_t;
 
 typedef struct {
+    /* Lista explícita de CPUs para los hilos de tick. `num_cpus == 0` (valor
+     * por defecto) NO crea hilos: el runtime es puramente pull, y un hilo
+     * durmiente por núcleo solo añadiría ruido a los núcleos aislados. */
     uint32_t enabled_cpus[ChronosRT_MAX_CPUS];
     uint32_t num_cpus;
     uint32_t event_pool_size;

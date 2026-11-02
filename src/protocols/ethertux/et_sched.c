@@ -26,6 +26,8 @@ ChronosRT_et_sched_t* ChronosRT_et_sched_create(uint32_t cycle_ns, uint64_t link
     }
     s->cycle_ns = (cycle_ns != 0u) ? cycle_ns : 1000000u;
     s->link_bps = (link_bps != 0u) ? link_bps : 1000000000ull;
+    /* Recíproco para calcular `now % cycle_ns` sin `idiv` por trama. */
+    s->cycle_recip = (UINT64_MAX / (uint64_t)s->cycle_ns) + 1u;
 
     /* Reparto proporcional 10 / 20 / 30 / 40 %. */
     uint32_t c = s->cycle_ns;
@@ -124,7 +126,9 @@ uint8_t ChronosRT_et_sched_window_at(const ChronosRT_et_sched_t* sched, uint64_t
     if (sched == NULL || sched->cycle_ns == 0u) {
         return ET_WINDOW_BEST_EFFORT;
     }
-    uint32_t phase = (uint32_t)(now_ns % (uint64_t)sched->cycle_ns);
+    /* Fase = now - (now / cycle) * cycle, con división por recíproco. */
+    const uint64_t q = (uint64_t)(((__uint128_t)now_ns * sched->cycle_recip) >> 64);
+    const uint32_t phase = (uint32_t)(now_ns - q * (uint64_t)sched->cycle_ns);
 
     uint32_t limit = sched->window_ns[ET_WINDOW_CONTROL];
     if (phase < limit) {

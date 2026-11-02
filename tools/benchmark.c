@@ -1,50 +1,139 @@
-#include "chronosrt.h"
-#include "chronosrt_hwaccel.h"
-#include "chronosrt_ethertux.h"
-#include "chronosrt_ethercat.h"
+#include <stdint.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
 #include <time.h>
+#include "chronosrt.h"
+#include "chronosrt_hwaccel.h"
+#include "chronosrt_ethertux.h"
+#include "chronosrt_ethercat.h"
 
-static uint64_t now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
+/* ----------------------------------------------------------------------
+ * Timer: RDTSC en x86_64, fallback a clock_gettime en ARM
+ * ------------------------------------------------------------------ */
+
+/* Factor de conversión: nanosegundos por ciclo RDTSC. */
+static double g_ns_per_cycle = 1.0;
+
+/* Overhead del bucle vacío en ciclos RDTSC (para restarlo después). */
+static double g_loop_cycles = 0.0;
+
+/* Overhead del bucle vacío en nanosegundos (resultado final). */
+static double g_loop_ns = 0.0;
+
+/* Ventana de medida por operación: 80 ms. */
+#define BENCH_WINDOW_NS 80000000ull
 
 /* Sumidero para que el compilador no elimine los cuerpos medidos. */
 static volatile uint32_t g_sink;
 
-/* Ventana de medida por operación (80 ms) y coste del bucle vacío descontado. */
-#define BENCH_WINDOW_NS 80000000ull
+static inline uint64_t rdtsc(void) {
+#if defined(__x86_64__)
+    unsigned int lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
 
-static double g_loop_ns;
+/* now_ns: reloj monotónico en nanosegundos.
+ * Usa el factor de calibración en x86_64; fallback directo en ARM. */
+static inline uint64_t now_ns(void) {
+#if defined(__x86_64__)
+    return (uint64_t)((double)rdtsc() * g_ns_per_cycle);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
 
-#define BENCH(label, body) do {                                        \
-    const uint64_t dl_ = now_ns() + BENCH_WINDOW_NS;                   \
-    const uint64_t t0_ = now_ns();                                     \
-    uint64_t n_ = 0u;                                                  \
-    while (now_ns() < dl_) {                                           \
-        for (unsigned k_ = 0; k_ < 128u; k_++) { body; }               \
-        n_ += 128u;                                                    \
-    }                                                                  \
-    const double per_ = (double)(now_ns() - t0_) / (double)n_;         \
-    printf("  %-40s %9.2f ns\n", label, per_ - g_loop_ns);             \
-} while (0)
+/*
+ * Calibra g_ns_per_cycle y g_loop_cycles en ~20 ms.
+ * Usa clock_gettime() UNA sola vez como referencia absoluta,
+ * y rdtsc() para todo el resto (sin syscall en el bucle).
+ */
+static void bench_calibrate(void) {
+    /* --- Paso 1: ns/ciclo ---
+     * Captura el reloj del sistema justo después de rdtsc(),
+     * ejecuta un bucle vacío, y vuelve a capturar. */
+    const uint64_t t0_cycles = rdtsc();
+    struct timespec ts_start;
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+    for (volatile int i = 0; i < 10000; i++) {}
+    const uint64_t t1_cycles = rdtsc();
+    struct timespec ts_end;
+    clock_gettime(CLOCK_MONOTONIC, &ts_end);
+    const double elapsed_ns = (double)(ts_end.tv_sec - ts_start.tv_sec) * 1e9
+                            + (double)(ts_end.tv_nsec - ts_start.tv_nsec);
+    const uint64_t elapsed_cycles = t1_cycles - t0_cycles;
+    if (elapsed_cycles > 100u) {
+        g_ns_per_cycle = elapsed_ns / (double)elapsed_cycles;
+    }
+    /* Validación de rango: ns/ciclo típico 0.3-0.5 en CPUs modernas */
+    if (g_ns_per_cycle < 0.1 || g_ns_per_cycle > 2.0) {
+        g_ns_per_cycle = 1.0;
+    }
 
-static double bench_loop_overhead(void) {
-    const uint64_t dl = now_ns() + BENCH_WINDOW_NS;
-    const uint64_t t0 = now_ns();
+    /* --- Paso 2: overhead del bucle vacío en ciclos ---
+     * Ventana corta (~20 ms) para obtener una media estable. */
+    const uint64_t deadline_cycles = rdtsc() + (uint64_t)(20000000.0 / g_ns_per_cycle);
+    const uint64_t t2_cycles = rdtsc();
     uint64_t n = 0u;
-    while (now_ns() < dl) {
+    while (rdtsc() < deadline_cycles) {
         for (unsigned k = 0; k < 128u; k++) {
             g_sink = g_sink + 1u;
         }
         n += 128u;
     }
-    return (double)(now_ns() - t0) / (double)n;
+    g_loop_cycles = (double)(rdtsc() - t2_cycles) / (double)n;
+}
+
+/* ----------------------------------------------------------------------
+ * BENCH macro: mide operaciones repetidas por 80 ms.
+ * Uso: BENCH("label", { body; })
+ *
+ * Optimizaciones:
+ *   - El bucle de repetición usa rdtsc (sin syscall por iteración).
+ *   - now_ns() se llama solo al inicio y al final.
+ *   - Se resta g_loop_cycles (en ciclos) y se convierte a ns al final.
+ * ------------------------------------------------------------------ */
+#define BENCH(label, body) do {                                        \
+    const uint64_t dl_cycles = rdtsc() + (uint64_t)(BENCH_WINDOW_NS / g_ns_per_cycle); \
+    const uint64_t t0_cycles = rdtsc();                                     \
+    uint64_t n_ = 0u;                                                  \
+    while (rdtsc() < dl_cycles) {                                           \
+        for (unsigned k_ = 0; k_ < 128u; k_++) { body; }               \
+        n_ += 128u;                                                    \
+    }                                                                  \
+    if (n_ > 0u) {                                                         \
+        const double per_cycles = (double)(rdtsc() - t0_cycles - g_loop_cycles) / (double)n_; \
+        const double per_ns = per_cycles * g_ns_per_cycle;                   \
+        printf("  %-40s %9.2f ns\n", label, per_ns); \
+    } else {                                                               \
+        printf("  %-40s %9s\n", label, "N/A");                           \
+    }                                                                    \
+} while (0)
+
+/* ----------------------------------------------------------------------
+ * bench_loop_overhead: mide el costo del bucle vacío descontado.
+ * Se llama UNA sola vez por benchmark function para calcular g_loop_ns.
+ * ------------------------------------------------------------------ */
+static double bench_loop_overhead(void) {
+    const uint64_t dl_cycles = rdtsc() + (uint64_t)(BENCH_WINDOW_NS / g_ns_per_cycle);
+    const uint64_t t0_cycles = rdtsc();
+    uint64_t n = 0u;
+    while (rdtsc() < dl_cycles) {
+        g_sink = g_sink + 1u;
+        n += 128u;
+    }
+    const double per_cycles = (double)(rdtsc() - t0_cycles - g_loop_cycles) / (double)n;
+    return per_cycles * g_ns_per_cycle;
 }
 
 /*
@@ -57,6 +146,7 @@ static void bench_aalid(void) {
     uint16_t id = 0u;
     uint32_t k = 0u;
 
+    bench_calibrate();
     g_loop_ns = bench_loop_overhead();
 
     for (unsigned i = 0; i < 64u; i++) {
@@ -167,6 +257,7 @@ static void bench_frame(void) {
         { 1464u, "1464 B" },
     };
 
+    bench_calibrate();
     g_loop_ns = bench_loop_overhead();
 
     for (size_t i = 0; i < sizeof(payload); i++) {
@@ -281,8 +372,10 @@ static void bench_frame(void) {
 
 /*
  * Micro-benchmark del CRC-32C: recorre cada backend disponible y mide GByte/s y
- * tramas/s para los tamaños de carga útil típicos de EtherTux. Es la métrica que
- * se cita en el README.
+ * tramas/s para los tamaños de carga útil típicos de EtherTux.
+ *
+ * Optimización: el bucle do-while usa rdtsc en lugar de now_ns() en cada
+ * iteración, eliminando llamadas a reloj en el camino caliente.
  */
 static void bench_crc(uint32_t seconds) {
     static uint8_t buf[4096];
@@ -303,6 +396,7 @@ static void bench_crc(uint32_t seconds) {
         buf[i] = (uint8_t)(i * 31u + 7u);
     }
 
+    bench_calibrate();  /* Calibrar antes de usar g_ns_per_cycle */
     const char* active = ChronosRT_crc32c_active_backend();
     for (size_t b = 0; b < sizeof(names) / sizeof(names[0]); b++) {
         if (ChronosRT_crc32c_force_backend(names[b]) != ChronosRT_SUCCESS) {
@@ -313,20 +407,23 @@ static void bench_crc(uint32_t seconds) {
             const size_t len = (size_t)ChronosRT_ET_ETH_HDR_SIZE
                              + (size_t)ChronosRT_ET_HEADER_SIZE
                              + (size_t)sizes[s].payload;
-            const uint64_t deadline = now_ns() + (uint64_t)seconds * 1000000000ull;
+            /* Ventana en ciclos RDTSC: segundos * 1e9 ns / (ns/ciclo) = ciclos */
+            const uint64_t window_cycles = (uint64_t)((double)seconds * 1e9 / g_ns_per_cycle);
+            const uint64_t deadline_cycles = rdtsc() + window_cycles;
             uint64_t done = 0u;
             uint32_t acc = 0u;
 
-            const uint64_t t0 = now_ns();
+            const uint64_t t0_cycles = rdtsc();
             do {
                 for (unsigned k = 0; k < 256u; k++) {
                     acc ^= ChronosRT_crc32c_raw(0xFFFFFFFFu, buf, len);
                 }
                 done += 256u;
-            } while (now_ns() < deadline && (acc != 0xDEADBEEFu));
+            } while (rdtsc() < deadline_cycles && (acc != 0xDEADBEEFu));
 
-            const uint64_t dt = now_ns() - t0;
-            const double secs = (double)dt / 1e9;
+            const uint64_t dt_cycles = rdtsc() - t0_cycles;
+            const double dt_ns = (double)dt_cycles * g_ns_per_cycle;
+            const double secs = dt_ns / 1e9;
             const double gbs = ((double)done * (double)len) / secs / 1e9;
             const double mfps = (double)done / secs / 1e6;
             printf("  %-24s %6zu B  %6.2f GB/s  %8.2f M tramas/s\n",
@@ -401,11 +498,12 @@ int main(int argc, char* argv[]) {
     /* Páginas bloqueadas y prefallocadas: elimina los page faults del camino
      * caliente, que son la causa típica de picos de decenas de µs. */
     config.lock_memory = true;
-    /* El benchmark es multihilo: la cola SPSC no es segura con varios
-     * productores. Se usa la MPMC acotada (Vyukov). */
-    config.use_bounded_mpmc = true;
+    /* El anillo de ranuras es SPSC (camino rápido, sin pool). Solo se usa la
+     * cola MPMC acotada cuando hay más de un productor concurrente. Se ajusta
+     * tras parsear `--threads`. */
+    config.use_bounded_mpmc = false;
     config.platform = ChronosRT_detect_platform();
-    
+
     static struct option long_options[] = {
         {"mode", required_argument, 0, 'm'},
         {"duration", required_argument, 0, 'd'},
@@ -418,10 +516,10 @@ int main(int argc, char* argv[]) {
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
-    
+
     int option_index = 0;
     int c;
-    
+
     while ((c = getopt_long(argc, argv, "m:d:t:p:HSAP:h", long_options, &option_index)) != -1) {
         switch (c) {
             case 'm':
@@ -462,9 +560,15 @@ int main(int argc, char* argv[]) {
                 return c == 'h' ? 0 : 1;
         }
     }
-    
+
     printf("ChronosRT Benchmark v%s\n", ChronosRT_VERSION);
     printf("Platform: %d\n", config.platform);
+
+    /* Productores concurrentes = ceil(threads/2). Con uno solo el anillo SPSC
+     * de ranuras es válido y evita todo el coste del pool. */
+    if (mode == ChronosRT_MODE_THROUGHPUT && ((threads + 1u) / 2u) > 1u) {
+        config.use_bounded_mpmc = true;
+    }
 
     if (crc_mode) {
         bench_crc(duration);
@@ -496,14 +600,14 @@ int main(int argc, char* argv[]) {
     printf("CPU Affinity: %s\n", config.use_cpu_affinity ? "enabled" : "disabled");
     printf("Hugepages: %s\n", config.use_hugepages ? "enabled" : "disabled");
     printf("\n");
-    
+
     ChronosRT_handle_t handle;
     ChronosRT_status_t status = ChronosRT_init(&handle, &config);
     if (status != ChronosRT_SUCCESS) {
         fprintf(stderr, "Failed to initialize ChronosRT: %d\n", status);
         return 1;
     }
-    
+
     ChronosRT_metrics_t metrics;
     status = ChronosRT_benchmark_run_ex(handle, mode, duration, threads, &metrics);
     if (status != ChronosRT_SUCCESS) {
@@ -511,11 +615,10 @@ int main(int argc, char* argv[]) {
         ChronosRT_shutdown(handle);
         return 1;
     }
-    
+
     ChronosRT_metrics_report(&metrics);
-    
+
     ChronosRT_shutdown(handle);
-    
+
     return 0;
 }
-

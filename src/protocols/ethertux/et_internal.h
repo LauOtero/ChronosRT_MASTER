@@ -63,9 +63,11 @@ typedef struct {
     uint8_t* tx_ring;             /* mmap del anillo                     */
     size_t   tx_ring_bytes;
     uint32_t tx_frame_size;       /* tp_frame_size                       */
-    uint32_t tx_frame_nr;         /* tramas en el anillo                 */
+    uint32_t tx_frame_nr;         /* tramas en el anillo (potencia de 2) */
+    uint32_t tx_frame_mask;       /* tx_frame_nr - 1: sin módulo          */
     uint32_t tx_head;             /* siguiente ranura candidata          */
     bool     tx_ring_active;
+    bool     tx_reserved;         /* ranura reservada pendiente de commit */
 } et_port_t;
 
 /* ------------------------------------------------------------------ */
@@ -81,6 +83,11 @@ struct ChronosRT_et_qos {
     et_bucket_t               tb[ChronosRT_ET_PRIORITIES];
     uint8_t                   eff[ChronosRT_ET_PRIORITIES];  /* LAPM         */
     bool                      lapm_active;
+    uint64_t                  last_refill_ns;    /* lazy refill: último refill completo */
+    uint64_t                  last_lazy_ns;      /* último refill lazy individual */
+    /* Coeficientes fijos (Q32) para no dividir en el camino caliente. */
+    uint64_t                  rate_q32[ChronosRT_ET_PRIORITIES];      /* B/ns × 2^32 */
+    uint64_t                  inv_burst_q32[ChronosRT_ET_PRIORITIES]; /* 100/burst × 2^32 */
     ChronosRT_et_qos_stats_t  stats;
 };
 
@@ -90,6 +97,7 @@ struct ChronosRT_et_qos {
 struct ChronosRT_et_sched {
     uint32_t           cycle_ns;
     uint64_t           link_bps;
+    uint64_t           cycle_recip;   /* magia para `now % cycle_ns` sin idiv */
     uint32_t           window_ns[ET_WINDOW_COUNT];
     ChronosRT_et_slot_t slots[ET_MAX_SLOTS];
     uint32_t           slot_count;
@@ -139,6 +147,7 @@ struct ChronosRT_et_master {
     uint8_t  tx_frame[ChronosRT_ET_MAX_FRAME];
     uint8_t  rx_frame[ChronosRT_ET_MAX_FRAME];
     uint8_t  aux[ChronosRT_ET_MAX_PAYLOAD];   /* cargas agregadas / mailbox */
+    uint8_t  fec_parity[ChronosRT_ET_MAX_PAYLOAD * (ChronosRT_RS_MAX_N - 1)]; /* buffer FEC pre-asignado */
 
     ChronosRT_et_master_stats_t stats;
 };
@@ -168,6 +177,11 @@ int      et_socket_tx_ring_kick(et_port_t* port);
 int      et_socket_tx_ring_put(et_port_t* port, const uint8_t* frame, uint32_t len);
 /** Ranuras del anillo (0 si el anillo no está activo). */
 int      et_socket_tx_ring_space(const et_port_t* port);
+/* Construcción sin copia: se reserva la ranura, se escribe la trama dentro y se
+ * confirma. Evita el memcpy trama→anillo del camino `put`. */
+uint8_t* et_socket_tx_reserve(et_port_t* port);
+void     et_socket_tx_commit(et_port_t* port, uint32_t len);
+void     et_socket_tx_cancel(et_port_t* port);
 
 /* ------------------------------------------------------------------ */
 /* et_master.c                                                         */

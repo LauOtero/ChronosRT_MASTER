@@ -2,7 +2,7 @@
  * chronosrt_resilience.c — Snapshot A/B (RS-1), WAL (RS-3) y golden image (RS-6).
  */
 #include "chronosrt_resilience.h"
-#include "chronosrt_simd.h"
+#include "chronosrt_hwaccel.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +11,27 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
+
+/*
+ * Integridad con CRC-32C (no XOR de hashes).
+ *
+ * La versión anterior combinaba los hashes de los bloques con XOR: al ser
+ * conmutativo, un reordenamiento de bloques dentro del payload era invisible, y
+ * el *fallback* ignoraba los bytes finales (< 4). El CRC-32C es hardware
+ * (SSE4.2 / ARMv8) y por tanto más rápido y con detección de errores real.
+ */
+static inline uint32_t chronosrt_record_crc(uint64_t seq, const void* rec, uint32_t len) {
+    uint8_t seqle[8];
+    for (int i = 0; i < 8; i++) {
+        seqle[i] = (uint8_t)(seq >> (8 * i));
+    }
+    uint32_t c = ChronosRT_crc32c_raw(0xFFFFFFFFu, seqle, sizeof(seqle));
+    if (len > 0u && rec != NULL) {
+        c = ChronosRT_crc32c_raw(c, rec, len);
+    }
+    return ~c;
+}
 
 /* ------------------------------------------------------------------------ */
 /* RS-1: snapshot A/B con seqlock                                           */
@@ -129,28 +150,21 @@ ChronosRT_status_t ChronosRT_wal_append(ChronosRT_wal_t* w, const void* rec, uin
 
     uint8_t hdr[CHRONOSRT_WAL_HDR];
     uint64_t seq = w->seq + 1;
-
-    uint32_t crc = 0;
-    {
-        /* CRC incremental sobre seq (8 bytes) + payload. */
-        uint8_t seqle[8];
-        for (int i = 0; i < 8; i++) {
-            seqle[i] = (uint8_t)(seq >> (8 * i));
-        }
-        crc = ChronosRT_simd_hash(seqle, sizeof(seqle));
-        if (len > 0) {
-            crc ^= ChronosRT_simd_hash(rec, len);
-        }
-    }
+    uint32_t crc = chronosrt_record_crc(seq, rec, len);
 
     memcpy(hdr, &len, 4);
     memcpy(hdr + 4, &crc, 4);
     memcpy(hdr + 8, &seq, 8);
 
-    if (write(w->fd, hdr, CHRONOSRT_WAL_HDR) != (ssize_t)CHRONOSRT_WAL_HDR) {
-        return ChronosRT_ERROR_IO;
-    }
-    if (len > 0 && write(w->fd, rec, len) != (ssize_t)len) {
+    /* Cabecera y carga en UNA sola llamada al sistema (writev). */
+    struct iovec iov[2];
+    iov[0].iov_base = hdr;
+    iov[0].iov_len  = CHRONOSRT_WAL_HDR;
+    iov[1].iov_base = (void*)rec;
+    iov[1].iov_len  = len;
+    const int iovcnt = (len > 0u) ? 2 : 1;
+
+    if (writev(w->fd, iov, iovcnt) != (ssize_t)(CHRONOSRT_WAL_HDR + len)) {
         return ChronosRT_ERROR_IO;
     }
 
@@ -170,7 +184,8 @@ ChronosRT_status_t ChronosRT_wal_sync(ChronosRT_wal_t* w) {
     if (w->pending == 0) {
         return ChronosRT_SUCCESS;
     }
-    if (fsync(w->fd) != 0) {
+    /* fdatasync: solo metadatos necesarios para recuperar los datos. */
+    if (fdatasync(w->fd) != 0) {
         return ChronosRT_ERROR_IO;
     }
     w->pending = 0;
@@ -244,18 +259,7 @@ int ChronosRT_wal_replay(const char* path,
             break;
         }
 
-        uint32_t check;
-        {
-            uint8_t seqle[8];
-            (void)seq;
-            for (int i = 0; i < 8; i++) {
-                seqle[i] = (uint8_t)(seq >> (8 * i));
-            }
-            check = ChronosRT_simd_hash(seqle, sizeof(seqle));
-            if (len > 0) {
-                check ^= ChronosRT_simd_hash(payload, len);
-            }
-        }
+        uint32_t check = chronosrt_record_crc(seq, payload, len);
         if (check != crc) {
             break; /* entrada corrupta: fin de la reproducción determinista */
         }
@@ -279,7 +283,7 @@ uint32_t ChronosRT_golden_crc(const void* data, uint32_t len) {
     if (!data || len == 0) {
         return 0;
     }
-    return ChronosRT_simd_hash(data, len);
+    return ChronosRT_crc32c(data, len);
 }
 
 ChronosRT_status_t ChronosRT_golden_save(const char* path, const void* data, uint32_t len) {

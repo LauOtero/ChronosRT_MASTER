@@ -24,7 +24,21 @@ struct ChronosRT_et_topology {
     ChronosRT_et_topology_config_t cfg;
     ChronosRT_et_node_info_t       nodes[ChronosRT_ET_MAX_NODES];
     uint32_t                       count;
+    /* Caché directa {hash(MAC) -> índice} validada en cada acierto: el camino
+     * por trama pasa de O(N) `memcmp` a un solo acceso. Al validar la MAC no
+     * necesita invalidación tras `remove`/`upsert` (reordenamientos incluidos). */
+    uint16_t                       mac_cache[ChronosRT_ET_MAX_NODES * 4u];
 };
+
+/* Hash de 6 B barato (multiplicación-xor): no hace falta CRC aquí. */
+static inline uint32_t topo_mac_hash(const uint8_t mac[6]) {
+    uint32_t h = 0x9E3779B9u;
+    h ^= (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) | ((uint32_t)mac[2] << 16) | ((uint32_t)mac[3] << 24);
+    h *= 0x85EBCA6Bu;
+    h ^= (uint32_t)mac[4] | ((uint32_t)mac[5] << 8);
+    h *= 0xC2B2AE35u;
+    return h ^ (h >> 16);
+}
 
 static inline void put_le16(uint8_t* p, uint16_t v) {
     p[0] = (uint8_t)(v & 0xFFu);
@@ -187,11 +201,33 @@ ChronosRT_status_t ChronosRT_et_topology_on_frame(ChronosRT_et_topology_t* topo,
         return ChronosRT_ERROR_INVALID;
     }
 
+    /* Camino rápido: caché validada por MAC (1 acceso, sin barrido). */
+    const uint32_t ch = topo_mac_hash(mac) & (uint32_t)(sizeof(topo->mac_cache) / sizeof(topo->mac_cache[0]) - 1u);
+    const uint32_t ci = topo->mac_cache[ch];
+    if (ci < topo->count && memcmp(topo->nodes[ci].mac, mac, 6u) == 0) {
+        ChronosRT_et_node_info_t* n = &topo->nodes[ci];
+        n->last_seen_ns = now_ns;
+        ChronosRT_et_state_t st;
+        if (ChronosRT_et_esm_state_from_wire(h->state, &st)) {
+            n->state = st;
+        }
+        n->last_wkc = h->wkc;
+        if (n->expected_wkc != 0u && h->wkc != n->expected_wkc) {
+            if (n->wkc_mismatch_count < UINT8_MAX) {
+                n->wkc_mismatch_count++;
+            }
+            return ChronosRT_ERROR_CORRUPT;
+        }
+        n->wkc_mismatch_count = 0u;
+        return ChronosRT_SUCCESS;
+    }
+
     for (uint32_t i = 0; i < topo->count; i++) {
         ChronosRT_et_node_info_t* n = &topo->nodes[i];
         if (memcmp(n->mac, mac, 6u) != 0) {
             continue;
         }
+        topo->mac_cache[ch] = (uint16_t)i;   /* refresca la caché */
 
         n->last_seen_ns = now_ns;
         ChronosRT_et_state_t st;

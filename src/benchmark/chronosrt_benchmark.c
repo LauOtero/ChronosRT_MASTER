@@ -27,7 +27,7 @@ typedef struct ChronosRT_bench {
     ChronosRT_benchmark_mode_t mode;
     uint32_t duration_sec;
     ChronosRT_metrics_t metrics;
-    volatile bool running;
+    _Atomic bool running;                 /* publicado entre hilos: sin carrera */
     pthread_t threads[16];
     ChronosRT_bench_arg_t args[16];
     uint64_t thread_events[16];
@@ -158,9 +158,16 @@ static void* bench_latency_thread(void* arg) {
     (void)bench_pin_current(0);
     bench_apply_rt(bench);
     bench_warmup(bench, 20000);
-    ChronosRT_hist_init(&hist, 100);
+    /* Resolución de 25 ns: con el reloj TSC las latencias son de decenas de ns
+     * y un bucket de 100 ns perdería toda la distribución. */
+    ChronosRT_hist_init(&hist, 25);
+
+    /* Uso de CPU real del hilo durante la ventana medida (no 0 % ficticio). */
+    struct timespec cpu0, cpu1;
+    (void)clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu0);
+    const uint64_t wall0 = ChronosRT_get_timestamp_ns();
     
-    while (bench->running) {
+    while (atomic_load_explicit(&bench->running, memory_order_relaxed)) {
         start_ns = ChronosRT_get_timestamp_ns();
         
         ChronosRT_status_t ret = ChronosRT_event_publish(bench->handle, &test_data, sizeof(test_data));
@@ -180,6 +187,15 @@ static void* bench_latency_thread(void* arg) {
                 update_wcet(&bench->metrics, lat);
             }
         }
+    }
+
+    const uint64_t wall1 = ChronosRT_get_timestamp_ns();
+    (void)clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu1);
+    {
+        const double cpu_ns = (double)(cpu1.tv_sec - cpu0.tv_sec) * 1e9 +
+                              (double)(cpu1.tv_nsec - cpu0.tv_nsec);
+        const double wall_ns = (wall1 > wall0) ? (double)(wall1 - wall0) : 0.0;
+        bench->metrics.cpu_usage_percent = (wall_ns > 0.0) ? (100.0 * cpu_ns / wall_ns) : 0.0;
     }
     
     if (count > 0) {
@@ -208,7 +224,7 @@ static void* bench_throughput_producer(void* arg) {
     bench_apply_rt(bench);
     bench_warmup(bench, 2000);
 
-    while (bench->running) {
+    while (atomic_load_explicit(&bench->running, memory_order_relaxed)) {
         for (int i = 0; i < 1000; i++) {
             if (ChronosRT_event_publish(bench->handle, &test_data,
                                         sizeof(test_data)) == ChronosRT_SUCCESS) {
@@ -230,7 +246,7 @@ static void* bench_throughput_consumer(void* arg) {
     (void)bench_pin_current(a->index);
     bench_apply_rt(bench);
 
-    while (bench->running) {
+    while (atomic_load_explicit(&bench->running, memory_order_relaxed)) {
         if (ChronosRT_event_subscribe(bench->handle, &event, 0) == ChronosRT_SUCCESS) {
             count++;
         } else {
@@ -250,7 +266,7 @@ static void* bench_stress_thread(void* arg) {
     (void)bench_pin_current(a->index);
     bench_apply_rt(bench);
     
-    while (bench->running) {
+    while (atomic_load_explicit(&bench->running, memory_order_relaxed)) {
         for (int i = 0; i < 10000; i++) {
             counter++;
             counter *= 3;
@@ -271,7 +287,7 @@ ChronosRT_status_t ChronosRT_benchmark_run_ex(ChronosRT_handle_t handle, Chronos
     bench.handle = handle;
     bench.mode = mode;
     bench.duration_sec = duration_sec;
-    bench.running = true;
+    atomic_init(&bench.running, true);
     if (mode == ChronosRT_MODE_LATENCY || mode == ChronosRT_MODE_JITTER ||
         mode == ChronosRT_MODE_WCET) {
         bench.num_threads = 1;
@@ -335,7 +351,7 @@ ChronosRT_status_t ChronosRT_benchmark_run_ex(ChronosRT_handle_t handle, Chronos
     }
     
     sleep(duration_sec);
-    bench.running = false;
+    atomic_store_explicit(&bench.running, false, memory_order_relaxed);
     
     uint64_t total_events = 0;
     for (uint32_t i = 0; i < bench.num_threads; i++) {
@@ -354,6 +370,11 @@ ChronosRT_status_t ChronosRT_benchmark_run_ex(ChronosRT_handle_t handle, Chronos
         }
         printf("[chronosrt] consumidos: %lu (%u productores, %u consumidores)\n",
                consumed, producers, bench.num_threads - producers);
+        if (duration_sec > 0u) {
+            printf("[chronosrt] throughput: %.2f M eventos/s (%llu eventos en %u s)\n",
+                   (double)total_events / (double)duration_sec / 1e6,
+                   (unsigned long long)total_events, duration_sec);
+        }
     }
     
     metrics->total_events = (mode == ChronosRT_MODE_THROUGHPUT)
@@ -368,6 +389,9 @@ ChronosRT_status_t ChronosRT_benchmark_run_ex(ChronosRT_handle_t handle, Chronos
     metrics->p99_ns = bench.metrics.p99_ns;
     metrics->p999_ns = bench.metrics.p999_ns;
     metrics->latency_spikes = bench.metrics.latency_spikes;
+    metrics->cpu_usage_percent = bench.metrics.cpu_usage_percent;
+    metrics->cache_miss_rate = bench.metrics.cache_miss_rate;
+    metrics->branch_miss_rate = bench.metrics.branch_miss_rate;
 
     if (!bench.rt_elevate) {
         printf("[chronosrt] SCHED_FIFO: omitido (%u hilos > %u CPUs disponibles)\n",
@@ -411,8 +435,14 @@ ChronosRT_status_t ChronosRT_metrics_report(const ChronosRT_metrics_t* metrics) 
                metrics->latency_spikes, ppm);
     }
     printf("CPU Usage (%%):       %.2f\n", metrics->cpu_usage_percent);
-    printf("Cache Miss Rate:     %.4f%%\n", metrics->cache_miss_rate);
-    printf("Branch Miss Rate:    %.4f%%\n", metrics->branch_miss_rate);
+    if (metrics->cache_miss_rate > 0.0 || metrics->branch_miss_rate > 0.0) {
+        printf("Cache Miss Rate:     %.4f%%\n", metrics->cache_miss_rate);
+        printf("Branch Miss Rate:    %.4f%%\n", metrics->branch_miss_rate);
+    } else {
+        /* No se muestrea `perf_event` en este modo: decirlo en vez de imprimir
+         * un 0.00 % que parece una medida. */
+        printf("Cache/Branch Miss:   n/a (no muestreado)\n");
+    }
     printf("================================\n\n");
     
     if (metrics->wcet_ns == 0) {

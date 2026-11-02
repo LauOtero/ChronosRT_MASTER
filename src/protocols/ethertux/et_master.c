@@ -357,7 +357,23 @@ static ChronosRT_status_t et_transmit_pdu(ChronosRT_et_master_t* master,
                                           const ChronosRT_et_header_t* h,
                                           const void* payload, uint16_t len,
                                           bool paced, uint64_t deadline_ns) {
+    /*
+     * I-4: con anillo TX activo se construye la trama DIRECTAMENTE en la ranura
+     * (cabecera Ethernet + PDU + CRC), sin el memcpy trama→anillo. Con pacing
+     * (`SO_TXTIME`) no se puede: el instante de envío viaja en el `cmsghdr` de
+     * `sendmsg`, así que se usa el búfer propio.
+     */
     uint8_t* frame = master->tx_frame;
+    bool in_ring = false;
+
+    if (!paced && master->port.tx_ring_active) {
+        uint8_t* slot = et_socket_tx_reserve(&master->port);
+        if (slot != NULL) {
+            frame = slot;
+            in_ring = true;
+        }
+        /* Si el anillo está lleno se degrada al búfer propio: no se pierde trama. */
+    }
 
     /*
      * Cabecera Ethernet II. Por defecto, difusión (el segmento EtherTux se
@@ -377,12 +393,22 @@ static ChronosRT_status_t et_transmit_pdu(ChronosRT_et_master_t* master,
                                            ChronosRT_ET_MAX_FRAME - ChronosRT_ET_ETH_HDR_SIZE,
                                            h, payload, len);
     if (body == 0u) {
+        if (in_ring) {
+            et_socket_tx_cancel(&master->port);   /* libera la ranura sin enviar */
+        }
         return ChronosRT_ERROR_INVALID;
     }
 
     uint32_t total = ChronosRT_ET_ETH_HDR_SIZE + body;
-    int rc = paced ? et_socket_send_at(&master->port, frame, total, deadline_ns)
+    int rc;
+    if (in_ring) {
+        et_socket_tx_commit(&master->port, total);
+        (void)et_socket_tx_ring_kick(&master->port);
+        rc = (int)total;
+    } else {
+        rc = paced ? et_socket_send_at(&master->port, frame, total, deadline_ns)
                    : et_socket_send(&master->port, frame, total);
+    }
     if (rc < 0) {
         return ChronosRT_ERROR_IO;
     }
@@ -583,12 +609,9 @@ ChronosRT_status_t ChronosRT_et_master_send_fec_block(ChronosRT_et_master_t* mas
 
     uint8_t k = master->fec->k;
     uint8_t n = master->fec->n;
-    uint32_t parity_bytes = (uint32_t)(n - k) * len;
 
-    uint8_t* parity_store = (uint8_t*)malloc(parity_bytes);
-    if (parity_store == NULL) {
-        return ChronosRT_ERROR_MEMORY;
-    }
+    /* Usar buffer pre-asignado en lugar de malloc/free (c elimination en el camino caliente). */
+    uint8_t* parity_store = master->fec_parity;
 
     uint8_t* par_ptrs[ChronosRT_RS_MAX_N];
     for (uint32_t j = 0; j < (uint32_t)(n - k); j++) {
@@ -597,7 +620,6 @@ ChronosRT_status_t ChronosRT_et_master_send_fec_block(ChronosRT_et_master_t* mas
 
     ChronosRT_status_t st = ChronosRT_et_fec_encode(master->fec, data, par_ptrs, len);
     if (st != ChronosRT_SUCCESS) {
-        free(parity_store);
         return st;
     }
 
@@ -609,7 +631,6 @@ ChronosRT_status_t ChronosRT_et_master_send_fec_block(ChronosRT_et_master_t* mas
                               data[i], (uint16_t)len, 1u, false, 0u,
                               (uint16_t)(base | (uint16_t)i));
         if (st != ChronosRT_SUCCESS) {
-            free(parity_store);
             return st;
         }
     }
@@ -619,14 +640,12 @@ ChronosRT_status_t ChronosRT_et_master_send_fec_block(ChronosRT_et_master_t* mas
                               par_ptrs[j], (uint16_t)len, 1u, false, 0u,
                               (uint16_t)(base | (uint16_t)(k + j)));
         if (st != ChronosRT_SUCCESS) {
-            free(parity_store);
             return st;
         }
     }
 
     master->block_seq++;
     master->stats.fec_blocks++;
-    free(parity_store);
     return ChronosRT_SUCCESS;
 }
 
@@ -852,8 +871,10 @@ int ChronosRT_et_master_recv(ChronosRT_et_master_t* master,
         uint64_t now = ChronosRT_tx_timestamp_ns();
 
         /* Si el origen ya usa una MAC local, su ID mantiene viva la entrada CAM
-         * y el temporizador de admisión (heartbeat implícito por tráfico). */
-        if (master->aalid != NULL) {
+         * y el temporizador de admisión. El heartbeat tiene granularidad de
+         * segundos (60 s), así que muestrear 1 de cada 64 tramas basta y evita
+         * un hash por trama en el camino de recepción. */
+        if (master->aalid != NULL && (master->stats.frames_rx & 63u) == 0u) {
             const uint16_t src_id = ChronosRT_et_aalid_id_from_mac(src_mac);
             if (src_id != ChronosRT_ET_LOCAL_ID_NONE) {
                 (void)ChronosRT_et_aalid_heartbeat(master->aalid, src_id, now / 1000000ull);

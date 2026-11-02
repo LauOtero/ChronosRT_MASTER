@@ -20,6 +20,10 @@ void ChronosRT_hist_init(ChronosRT_hist_t* h, uint64_t bucket_ns) {
     memset(h, 0, sizeof(*h));
     h->bucket_ns = bucket_ns ? bucket_ns : 100; /* 100 ns por bucket por defecto */
     h->min_ns = UINT64_MAX;
+    h->prefix_sum_valid = false;
+    /* Recíproco con redondeo hacia arriba: floor(n/b) == (n*recip) >> 64 para
+     * todo n < 2^63, que cubre cualquier latencia expresada en ns. */
+    h->bucket_recip = (UINT64_MAX / h->bucket_ns) + 1u;
 }
 
 void ChronosRT_hist_reset(ChronosRT_hist_t* h) {
@@ -34,9 +38,12 @@ void ChronosRT_hist_record(ChronosRT_hist_t* h, uint64_t latency_ns) {
     if (!h) {
         return;
     }
-    uint64_t idx = latency_ns / h->bucket_ns;
+    /* División por recíproco: evita el `idiv` de 64 bits por muestra. */
+    const uint64_t idx = (uint64_t)(((__uint128_t)latency_ns * h->bucket_recip) >> 64);
     if (idx < CHRONOSRT_HIST_BUCKETS) {
         h->buckets[idx]++;
+        /* Invalidar cache de prefix-sum (se reconstruye lazy al siguiente percentile query). */
+        h->prefix_sum_valid = false;
     } else {
         h->overflow++;
     }
@@ -74,7 +81,7 @@ uint64_t ChronosRT_hist_stddev_ns(const ChronosRT_hist_t* h) {
     return (uint64_t)sqrt(var);
 }
 
-uint64_t ChronosRT_hist_percentile_ns(const ChronosRT_hist_t* h, double p) {
+uint64_t ChronosRT_hist_percentile_ns(ChronosRT_hist_t* h, double p) {
     if (!h || h->count == 0) {
         return 0;
     }
@@ -86,15 +93,27 @@ uint64_t ChronosRT_hist_percentile_ns(const ChronosRT_hist_t* h, double p) {
         target = 1;
     }
 
-    uint64_t acc = 0;
-    for (uint64_t i = 0; i < CHRONOSRT_HIST_BUCKETS; i++) {
-        acc += h->buckets[i];
-        if (acc >= target) {
-            /* límite superior del bucket i */
-            return (i + 1) * h->bucket_ns;
+    /* Reconstruir cache de prefix-sum lazy si está invalidada. */
+    if (!h->prefix_sum_valid) {
+        uint64_t acc = 0;
+        for (uint64_t i = 0; i < CHRONOSRT_HIST_BUCKETS; i++) {
+            acc += h->buckets[i];
+            h->prefix_sum[i] = acc;
+        }
+        h->prefix_sum_valid = true;
+    }
+
+    /* Búsqueda binaria O(log n) sobre prefix_sum. */
+    uint64_t lo = 0, hi = CHRONOSRT_HIST_BUCKETS - 1;
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2u;
+        if (h->prefix_sum[mid] >= target) {
+            hi = mid;
+        } else {
+            lo = mid + 1u;
         }
     }
-    return h->max_ns;
+    return (lo + 1u) * h->bucket_ns;
 }
 
 uint64_t ChronosRT_hist_wcet_ns(const ChronosRT_hist_t* h) {
@@ -109,6 +128,9 @@ void ChronosRT_hist_print(const ChronosRT_hist_t* h, const char* label) {
     if (!h) {
         return;
     }
+    /* El percentil reconstruye la caché de prefix-sum (mutación benigna del
+     * estado interno); se documenta con un cast explícito. */
+    ChronosRT_hist_t* hm = (ChronosRT_hist_t*)(uintptr_t)h;
     printf("[chronosrt] %s: n=%llu min=%llu ns mean=%llu ns stddev=%llu ns "
            "p99=%llu ns p99.9=%llu ns WCET=%llu ns (overflow=%llu)\n",
            label ? label : "latencia",
@@ -116,8 +138,8 @@ void ChronosRT_hist_print(const ChronosRT_hist_t* h, const char* label) {
            (unsigned long long)ChronosRT_hist_best_ns(h),
            (unsigned long long)ChronosRT_hist_mean_ns(h),
            (unsigned long long)ChronosRT_hist_stddev_ns(h),
-           (unsigned long long)ChronosRT_hist_percentile_ns(h, 99.0),
-           (unsigned long long)ChronosRT_hist_percentile_ns(h, 99.9),
+           (unsigned long long)ChronosRT_hist_percentile_ns(hm, 99.0),
+           (unsigned long long)ChronosRT_hist_percentile_ns(hm, 99.9),
            (unsigned long long)ChronosRT_hist_wcet_ns(h),
            (unsigned long long)h->overflow);
 }

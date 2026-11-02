@@ -42,7 +42,7 @@ static int64_t clamp_tokens(int64_t tokens, uint32_t burst) {
 }
 
 static void bucket_refill(et_bucket_t* b, const ChronosRT_et_bucket_cfg_t* cfg,
-                          uint64_t now_ns) {
+                          uint64_t rate_q32, uint64_t now_ns) {
     if (cfg->rate_bytes_per_sec == 0u || cfg->burst_bytes == 0u) {
         b->tokens = 0;
         b->last_ns = now_ns;
@@ -62,17 +62,25 @@ static void bucket_refill(et_bucket_t* b, const ChronosRT_et_bucket_cfg_t* cfg,
         dt = 1000000000ull;
     }
     b->last_ns = now_ns;
-    int64_t add = (int64_t)((cfg->rate_bytes_per_sec * dt) / 1000000000ull);
+    /* bytes = (dt_ns · rate_q32) >> 32, sin división de 64 bits. */
+    int64_t add = (int64_t)(((__uint128_t)dt * rate_q32) >> 32);
     b->tokens = clamp_tokens(b->tokens + add, cfg->burst_bytes);
 }
 
 static void qos_refill_all(ChronosRT_et_qos_t* q, uint64_t now_ns) {
     for (unsigned i = 0; i < ChronosRT_ET_PRIORITIES; i++) {
-        bucket_refill(&q->tb[i], &q->cfg.bucket[i], now_ns);
+        bucket_refill(&q->tb[i], &q->cfg.bucket[i], q->rate_q32[i], now_ns);
     }
 }
 
-/* Ocupación del bucket en porcentaje (100 % = vacío). */
+/* Lazy refill: solo actualiza el bucket solicitado. Los demás se refillan
+ * periódicamente (cada 1 ms) o cuando se consultan vía backpressure. */
+static void qos_refill_lazy(ChronosRT_et_qos_t* q, uint8_t cls, uint64_t now_ns) {
+    bucket_refill(&q->tb[cls], &q->cfg.bucket[cls], q->rate_q32[cls], now_ns);
+    q->last_refill_ns = now_ns;
+}
+
+/* Ocupación del bucket en porcentaje (100 % = vacío), sin división. */
 static uint32_t bucket_occupancy(const ChronosRT_et_qos_t* q, unsigned cls) {
     uint32_t burst = q->cfg.bucket[cls].burst_bytes;
     if (burst == 0u) {
@@ -85,7 +93,7 @@ static uint32_t bucket_occupancy(const ChronosRT_et_qos_t* q, unsigned cls) {
     if (used <= 0) {
         return 0u;
     }
-    return (uint32_t)((used * 100) / (int64_t)burst);
+    return (uint32_t)(((uint64_t)used * q->inv_burst_q32[cls]) >> 32);
 }
 
 static void qos_update_lapm(ChronosRT_et_qos_t* q) {
@@ -187,8 +195,15 @@ ChronosRT_status_t ChronosRT_et_qos_configure(ChronosRT_et_qos_t* qos,
         qos->tb[i].tokens = (int64_t)cfg->bucket[i].burst_bytes;
         qos->tb[i].last_ns = 0u;
         qos->eff[i] = (uint8_t)i;
+        /* Q32: bytes por ns y 100/burst, ambos con recíproco fijo. */
+        qos->rate_q32[i] = (uint64_t)(((__uint128_t)cfg->bucket[i].rate_bytes_per_sec << 32)
+                                      / 1000000000ull);
+        qos->inv_burst_q32[i] = (uint64_t)(((__uint128_t)100u << 32)
+                                           / cfg->bucket[i].burst_bytes);
     }
     qos->lapm_active = false;
+    qos->last_refill_ns = 0u;
+    qos->last_lazy_ns = 0u;
     return ChronosRT_SUCCESS;
 }
 
@@ -200,11 +215,21 @@ ChronosRT_status_t ChronosRT_et_qos_admit(ChronosRT_et_qos_t* qos,
     }
 
     uint64_t now = (now_ns != 0u) ? now_ns : ChronosRT_tx_timestamp_ns();
-    qos_refill_all(qos, now);
+
+    /* Lazy refill: solo refill completo si han pasado > 1 ms desde el último,
+     * si no refillamos solo el bucket de la clase efectiva. */
+    if (now - qos->last_refill_ns > 1000000ull) {
+        qos_refill_all(qos, now);
+    }
+    /* LAPM: dos lecturas y una multiplicación-shift por clase (sin división). */
     qos_update_lapm(qos);
 
     int cls = (int)qos->eff[priority];
     for (;;) {
+        if (now - qos->last_lazy_ns > 500000ull) {
+            bucket_refill(&qos->tb[cls], &qos->cfg.bucket[cls], qos->rate_q32[cls], now);
+            qos->last_lazy_ns = now;
+        }
         if (qos->tb[cls].tokens >= (int64_t)bytes) {
             qos->tb[cls].tokens -= (int64_t)bytes;
             qos->stats.admitted++;
