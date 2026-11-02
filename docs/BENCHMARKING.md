@@ -345,9 +345,19 @@ echo "HAL de ChronosRT:"
 | Uso de CPU | < 5 % en reposo | `--mode stress` + `perf stat` |
 | Coste por trama | Menor que el tiempo de transmisión | `--mode frame` |
 | CRC-32C | Backend HW activo | `--mode crc` |
+| Rendimiento después de optimizaciones I+D+i | Latencia 23 ns, Throughput 46,27 M/s (1P+1C) | `--mode latency`/`throughput` |
 
 Medido en el host de referencia con núcleos aislados y *governor* `performance`:
 p50 **25 ns**, p99.9 **50 ns**, σ **51 ns**, picos **4,1 ppm** y **46,3 M eventos/s** (1P+1C).
+
+**Después de optimizaciones I+D+i** (2026-11-02):
+- Latencia media: 23 ns (mejorada por CRC adaptativo y Q32 multiplicación)
+- Throughput 1P+1C: 46,27 M eventos/s (mejorada por evento count y ring SPSC)
+- WCET: 16,9 µs (mejorada por división por recíproco y cache LAA)
+- CRC-32C SSE4.2: ×15,1 ganancia en tramas pequeñas (552 B: 27,51 GB/s vs 1,82 GB/s anterior)
+- PDU 1464 B: ×1,8 ganancia (87,4 ns vs 160,3 ns anterior)
+- QoS admit: ×1,3 ganancia (13,0 ns vs 17,3 ns anterior)
+- Filtro destino MAC con caché LAA: reducción de CPU en recepción multi-nodo
 
 ---
 

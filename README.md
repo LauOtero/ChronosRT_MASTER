@@ -94,6 +94,7 @@ build `Release`, *governor* **`performance`**, **núcleos 2–3 aislados** con
 | HAL detectada | `crc32c_backend = "sse4.2-x4"`, `fec_backend = "avx2"` |
 | Benchmark | `--mode frame`, `crc`, `aalid`, `latency`, `jitter`, `wcet` y `throughput`; eleva a `SCHED_FIFO`, calienta y publica p50/p99/p99.9 + picos > 10 µs |
 | Versión / ABI | `0.1.0` / `0x000100` · SONAME `libchronosrt.so.0` |
+| Rendimiento actual | Latencia 23 ns (p50 25 ns, p99.9 50 ns), Throughput 46,27 M eventos/s (1P+1C), WCET 16,9 µs |
 
 > Los objetivos de latencia (< 10 µs), jitter (σ < 1 µs) y throughput
 > (> 10 M eventos/s) dependen del kernel y del aislamiento de CPU. En la campaña
@@ -344,6 +345,7 @@ y rango) y coste del bucle vacío descontado.
 | Admisión QoS P2 / 576 B | **13,0 ns** [12,7–13,1] |
 | Ventana TDMA (superframe 1 ms) | **1,95 ns** [1,90–1,96] |
 | CRC-32C con MTU completa (`sse4.2-x4`) | **23,55 GB/s · 15,7 M tramas/s** |
+| **Mejoras I+D+i** | CRC-32C SSE4.2: ×15,1 en 552 B, PDU 1464 B: ×1,8 (87,4 ns vs 160,3 ns), QoS admit: ×1,3 (13,0 ns vs 17,3 ns) |
 
 Lectura: el coste de CPU queda muy por debajo del tiempo de transmisión; el
 límite práctico es el **enlace**, no el software.
@@ -418,6 +420,7 @@ repeticiones** (23 / 25 / 50 / 50 ns); lo único que varía es el WCET (15,9–1
 | CRC 1504 B | 12,21 GB/s | **23,55 GB/s** | ×1,9 |
 | PDU 1464 B | 160,3 ns | **87,4 ns** | ×1,8 |
 | QoS admit | 17,3 ns | **13,0 ns** | ×1,3 |
+| **Optimizaciones I+D+i aplicadas** | — | **CRC-32C SSE4.2, Q32 multiplicación, caché LAA, filtrado temprano MAC** | **Mejora global** |
 
 **`-march=native` no aporta nada medible.** Se compiló una segunda variante con
 `-DCHRONOSRT_ENABLE_NATIVE=ON` y se repitió la campaña: latencia media **23 ns**
