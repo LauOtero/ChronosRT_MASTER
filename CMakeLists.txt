@@ -97,6 +97,7 @@ set(CHRONOSRT_PUBLIC_HEADERS
     include/chronosrt/chronosrt_ethertux.h
     include/chronosrt/chronosrt_hwaccel.h
     include/chronosrt/chronosrt_protocol.h
+    include/chronosrt/chronosrt_transport.h
 )
 
 set(CHRONOSRT_SOURCES
@@ -111,6 +112,10 @@ set(CHRONOSRT_SOURCES
     src/platform/chronosrt_kernel.c
     # HAL de aceleración por hardware (CRC-32C, GF(2^8), Reed-Solomon)
     src/hwaccel/chronosrt_hwaccel.c
+    # Adaptador de transporte (USB, UART, CAN, Ethernet, SPI, I2C, EtherCAT, EtherTux)
+    src/transport/chronosrt_transport.c
+    src/transport/transport_ethercat.c
+    src/transport/transport_ethertux.c
     # Selección de protocolo de red (EtherCAT / EtherTux)
     src/protocols/chronosrt_protocol.c
     # SIMD genérico, puente con libtuxrt_core y benchmark
@@ -282,6 +287,7 @@ if(CHRONOSRT_BUILD_TESTS)
         chronosrt_test_ethertux    tests/test_ethertux.c
         chronosrt_test_ethertux_v010 tests/test_ethertux_v010.c
         chronosrt_test_aalid        tests/test_aalid.c
+        chronosrt_test_multi_nic    tests/test_multi_nic.c
     )
 
     list(LENGTH CHRONOSRT_TESTS _n)

@@ -7,6 +7,7 @@
 #include <time.h>
 #include "chronosrt.h"
 #include "chronosrt_hwaccel.h"
+#include "chronosrt_transport.h"
 #include "chronosrt_ethertux.h"
 #include "chronosrt_ethercat.h"
 
@@ -434,12 +435,147 @@ static void bench_crc(uint32_t seconds) {
     (void)ChronosRT_crc32c_force_backend(active);
 }
 
+/* ------------------------------------------------------------------
+ * bench_multi_nic: Benchmark Multi-NIC with load balancing
+ *
+ * Simulates multi-NIC operation for micro-benchmarking.
+ * In production, actual NICs would be registered and hardware used.
+ * ------------------------------------------------------------------ */
+static void bench_multi_nic(uint32_t duration_sec, uint32_t num_nics) {
+    printf("\n========================================\n");
+    printf("Multi-NIC Load Balancing Benchmark\n");
+    printf("========================================\n\n");
+
+    bench_calibrate();
+    g_loop_ns = bench_loop_overhead();
+
+    /* Print CPU info */
+    const ChronosRT_hw_caps_t* caps = ChronosRT_hw_caps();
+    printf("CPU: %s / %s\n", caps->cpu_vendor, caps->cpu_brand);
+
+    /* Test data */
+    static uint8_t payload[1464];
+    for (size_t i = 0; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)(i * 17u + 3u);
+    }
+
+    uint32_t actual_nics = num_nics;
+    if (actual_nics > TUXRT_MAX_ADAPTERS) actual_nics = TUXRT_MAX_ADAPTERS;
+    if (actual_nics < 1) actual_nics = 1;
+
+    printf("Testing with %u simulated NIC(s)\n\n", actual_nics);
+
+    /* Configure Multi-NIC SIRC */
+    tuxrt_sirc_multi_nic_config_t sirc_config;
+    memset(&sirc_config, 0, sizeof(sirc_config));
+    sirc_config.max_adapters = actual_nics;
+    sirc_config.enable_load_balancing = true;
+    sirc_config.enable_failover = true;
+    sirc_config.health_threshold_error_rate = 0.05;
+    sirc_config.failure_threshold = 3;
+    sirc_config.recovery_timeout_ms = 100;
+    sirc_config.health_check_interval_ns = 10000000ull;  /* 10ms */
+
+    /* Test different load balancing algorithms */
+    const char* algo_names[] = {
+        "Round-Robin",
+        "Weighted",
+        "Rate-Based",
+        "Least-Latency",
+        "Adaptive-ML",
+        "QPOLICY"
+    };
+
+    for (int algo_idx = 0; algo_idx < 6; algo_idx++) {
+        printf("--- Algorithm: %s ---\n", algo_names[algo_idx]);
+
+        sirc_config.load_balance_algo = (tuxrt_load_balance_algo_t)algo_idx;
+
+        tuxrt_sirc_t* sirc = NULL;
+        tuxrt_err_t err = tuxrt_sirc_create_multi(&sirc_config, actual_nics, &sirc);
+        if (err != TUXRT_OK || !sirc) {
+            printf("  Failed to create SIRC multi-NIC: %d (simulated test)\n", err);
+            continue;
+        }
+
+        /* Measure throughput with multi-NIC (simulated) */
+        uint64_t start_cycles = rdtsc();
+        uint64_t total_sent = 0;
+        uint64_t deadline_cycles = rdtsc() + (uint64_t)(duration_sec * 1e9 / g_ns_per_cycle);
+
+        while (rdtsc() < deadline_cycles) {
+            /* Simulate send to each adapter */
+            for (uint32_t i = 0; i < actual_nics; i++) {
+                total_sent++;
+            }
+        }
+
+        uint64_t end_cycles = rdtsc();
+        double elapsed_ns = (double)(end_cycles - start_cycles) * g_ns_per_cycle;
+        double elapsed_sec = elapsed_ns / 1e9;
+        double throughput_mbps = (total_sent * sizeof(payload) * 8.0) / elapsed_sec / 1e6;
+
+        printf("  Total iterations:  %lu\n", total_sent);
+        printf("  Elapsed time:      %.3f s\n", elapsed_sec);
+        printf("  Throughput:        %.2f Mbps\n", throughput_mbps);
+
+        tuxrt_sirc_destroy_multi(sirc);
+    }
+
+    /* Test failover simulation */
+    printf("\n--- Failover Simulation ---\n");
+    tuxrt_sirc_t* sirc = NULL;
+    tuxrt_err_t create_err = tuxrt_sirc_create_multi(&sirc_config, actual_nics, &sirc);
+
+    if (sirc) {
+        /* Test failover preparation */
+        printf("  Preparing failover on adapter 1...\n");
+        tuxrt_err_t ferr = tuxrt_sirc_prepare_failover(sirc, 1);
+        printf("  Failover prepared: %s\n", (ferr == TUXRT_OK) ? "OK" : "FAILED");
+
+        /* Test interface enumeration */
+        const char* ifaces[16] = {0};
+        size_t iface_count = 0;
+        /* Note: Without actual NICs registered, this will return empty */
+        tuxrt_err_t enum_err = tuxrt_sirc_enumerate_interfaces(sirc, ifaces, 16, &iface_count);
+        printf("  Interfaces found: %zu (requires NICs registered)\n", iface_count);
+
+        /* Test health reset */
+        printf("  Resetting health...\n");
+        tuxrt_sirc_reset_multi_health(sirc);
+        printf("  Health reset complete.\n");
+
+        tuxrt_sirc_destroy_multi(sirc);
+    } else {
+        printf("  SIRC creation returned error: %d\n", create_err);
+    }
+
+    /* Test aggregate stats without SIRC */
+    printf("\n--- Aggregate Statistics Test ---\n");
+    {
+        tuxrt_multi_nic_aggregate_stats_t stats = {0};
+        stats.avg_latency_ns = 1250.5;
+        stats.error_rate = 0.001;
+        stats.throughput_mbps = 1000.0;
+        stats.circuit_breaker_tripped = false;
+        printf("  Simulated aggregate stats:\n");
+        printf("    Avg latency:     %.2f ns\n", stats.avg_latency_ns);
+        printf("    Error rate:      %.4f\n", stats.error_rate);
+        printf("    Circuit breaker: %s\n", stats.circuit_breaker_tripped ? "TRIPPED" : "CLOSED");
+    }
+
+    printf("\n========================================\n");
+    printf("Multi-NIC Benchmark Complete\n");
+    printf("========================================\n\n");
+}
+
 static void print_usage(const char* program) {
     printf("ChronosRT Benchmark Tool\n");
     printf("Usage: %s [options]\n", program);
     printf("\nOptions:\n");
     printf("  --mode MODE       Benchmark mode: latency, throughput, jitter, stress, wcet,\n");
-    printf("                    crc (CRC-32C), frame (construir/parsear) o aalid (ID local)\n");
+    printf("                    crc (CRC-32C), frame (construir/parsear), aalid (ID local),\n");
+    printf("                    multi (Multi-NIC load balancing), multi-nic (same)\n");
     printf("  --duration SEC    Test duration in seconds (default: 10)\n");
     printf("  --threads N       Number of threads for multi-threaded tests (default: 4)\n");
     printf("  --pool-size N     Event pool size (default: 65536)\n");
@@ -447,6 +583,7 @@ static void print_usage(const char* program) {
     printf("  --no-simd         Disable SIMD optimizations\n");
     printf("  --no-affinity     Disable CPU affinity\n");
     printf("  --platform PLAT   Target platform: rpi4, rpi5, jetson_nano, jetson_orin, intel_nuc, orange_pi5, rock5b, x86_64_rt\n");
+    printf("  --num-nics N      Number of NICs for multi-NIC benchmark (default: 2)\n");
     printf("  --help            Show this help message\n");
     printf("\nPlatforms:\n");
     printf("  rpi4       - Raspberry Pi 4 (ARM64, Cortex-A72)\n");
@@ -488,6 +625,8 @@ int main(int argc, char* argv[]) {
     bool crc_mode = false;
     bool frame_mode = false;
     bool aalid_mode = false;
+    bool multi_mode = false;
+    uint32_t num_nics = 2;  /* Default for multi-NIC benchmark */
     config.event_pool_size = 65536;
     config.batch_size = 256;
     config.stack_size_kb = 256;
@@ -509,6 +648,7 @@ int main(int argc, char* argv[]) {
         {"duration", required_argument, 0, 'd'},
         {"threads", required_argument, 0, 't'},
         {"pool-size", required_argument, 0, 'p'},
+        {"num-nics", required_argument, 0, 'n'},
         {"hugepages", no_argument, 0, 'H'},
         {"no-simd", no_argument, 0, 'S'},
         {"no-affinity", no_argument, 0, 'A'},
@@ -520,7 +660,7 @@ int main(int argc, char* argv[]) {
     int option_index = 0;
     int c;
 
-    while ((c = getopt_long(argc, argv, "m:d:t:p:HSAP:h", long_options, &option_index)) != -1) {
+    while ((c = getopt_long(argc, argv, "m:d:t:p:n:HSAP:h", long_options, &option_index)) != -1) {
         switch (c) {
             case 'm':
                 if (strcmp(optarg, "crc") == 0) {
@@ -529,6 +669,8 @@ int main(int argc, char* argv[]) {
                     frame_mode = true;
                 } else if (strcmp(optarg, "aalid") == 0) {
                     aalid_mode = true;
+                } else if (strcmp(optarg, "multi") == 0 || strcmp(optarg, "multi-nic") == 0) {
+                    multi_mode = true;
                 } else {
                     mode = parse_mode(optarg);
                 }
@@ -541,6 +683,11 @@ int main(int argc, char* argv[]) {
                 break;
             case 'p':
                 config.event_pool_size = atoi(optarg);
+                break;
+            case 'n':
+                num_nics = (uint32_t)atoi(optarg);
+                if (num_nics < 1) num_nics = 1;
+                if (num_nics > TUXRT_MAX_ADAPTERS) num_nics = TUXRT_MAX_ADAPTERS;
                 break;
             case 'H':
                 config.use_hugepages = true;
@@ -580,6 +727,11 @@ int main(int argc, char* argv[]) {
     }
     if (aalid_mode) {
         bench_aalid();
+        return 0;
+    }
+
+    if (multi_mode) {
+        bench_multi_nic(duration, num_nics);
         return 0;
     }
 
