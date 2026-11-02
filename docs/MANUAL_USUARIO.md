@@ -56,7 +56,6 @@ ChronosRT Master se utiliza en sistemas industriales como:
 > dependen del kernel y del hardware. El manual técnico y la guía de
 > benchmarking explican cómo medirlas y qué se ha medido realmente.
 
-
 ### 1.3 Conceptos Básicos
 
 Antes de continuar, es importante entender algunos términos:
@@ -73,6 +72,7 @@ Antes de continuar, es importante entender algunos términos:
 ### 2.1 Requisitos de Hardware
 
 #### Hardware Mínimo
+
 | Componente | Requisito Mínimo |
 |------------|------------------|
 | Procesador | ARM64 (AArch64), ARMv7 o x86_64 con soporte SIMD |
@@ -114,7 +114,6 @@ motor criptográfico, PHC y flags de compilación.
 > Desde Linux 6.12, PREEMPT_RT está integrado en mainline y se activa con
 > `preempt=full`. ChronosRT detecta el estado real del kernel y avisa si no hay
 > RT; no modifica la configuración del sistema.
-
 
 ### 2.3 Requisitos de Red
 
@@ -199,7 +198,6 @@ También puede usar el script de ayuda, que resuelve toolchain y flags por SBC:
 ./scripts/build.sh --sbc rpi5 --release
 ```
 
-
 #### Paso 4: Compilar
 
 ```bash
@@ -253,7 +251,6 @@ Cada binario informa además su número de aserciones:
 
 Total: **547 aserciones**.
 
-
 ### 3.3 Instalación en Plataformas Específicas
 
 #### Raspberry Pi 4/5
@@ -300,7 +297,6 @@ aplicación los cargue y rellene la estructura.
 ~/.config/chronosrt/      # Configuración por usuario (plantilla)
 ./config/                 # Configuración local del proyecto (plantilla)
 ```
-
 
 ### 4.2 Archivo de Configuración Principal
 
@@ -448,30 +444,30 @@ export ChronosRT_DIAGNOSTIC=1
 
 #### Procedimiento de Arranque Estándar
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                ARRANQUE DE ChronosRT Master                 │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│   1. Verificar requisitos del sistema                       │
-│      └─> ¿Hardware compatible?                              │
-│      └─> ¿Dependencias instaladas?                          │
-│                                                             │
-│   2. Cargar configuración                                   │
-│      └─> ¿Archivo de configuración existe?                  │
-│      └─> ¿Parámetros válidos?                               │
-│                                                             │
-│   3. Inicializar componentes                                │
-│      └─> ¿Memoria asignada correctamente?                   │
-│      └─> ¿Threads creados?                                  │
-│                                                             │
-│   4. Verificar conectividad                                 │
-│      └─> ¿Red funcional?                                    │
-│      └─> ¿Esclavos detectados?                              │
-│                                                             │
-│   5. Sistema OPERATIVO                                      │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    start([Inicio del arranque])
+    step1["1. Verificar requisitos del sistema"]
+    chk1{"¿Hardware compatible?<br/>¿Dependencias instaladas?"}
+    step2["2. Cargar configuración"]
+    chk2{"¿Archivo de configuración existe?<br/>¿Parámetros válidos?"}
+    step3["3. Inicializar componentes"]
+    chk3{"¿Memoria asignada correctamente?<br/>¿Threads creados?"}
+    step4["4. Verificar conectividad"]
+    chk4{"¿Red funcional?<br/>¿Esclavos detectados?"}
+    step5["5. Sistema OPERATIVO"]
+    error([Error: abortar])
+    ok([Operativo])
+
+    start --> step1 --> chk1
+    chk1 -->|No| error
+    chk1 -->|Sí| step2 --> chk2
+    chk2 -->|No| error
+    chk2 -->|Sí| step3 --> chk3
+    chk3 -->|No| error
+    chk3 -->|Sí| step4 --> chk4
+    chk4 -->|No| error
+    chk4 -->|Sí| step5 --> ok
 ```
 
 #### Script de Arranque Manual
@@ -516,23 +512,17 @@ echo "Ejecuta './build/chronosrt_bench' para comenzar."
 
 #### Procedimiento de Apagado Seguro
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                APAGADO DE ChronosRT Master                  │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│   1. Detener recepción de nuevos eventos                    │
-│                                                             │
-│   2. Esperar a que eventos pendientes completen             │
-│      (timeout de 5 segundos)                                │
-│                                                             │
-│   3. Liberar recursos de memoria                            │
-│                                                             │
-│   4. Cerrar conexiones de red                               │
-│                                                             │
-│   5. Terminar threads de trabajo                            │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    start([Inicio del apagado])
+    step1["1. Detener recepción de nuevos eventos"]
+    step2["2. Esperar a que eventos pendientes completen<br/>(timeout de 5 segundos)"]
+    step3["3. Liberar recursos de memoria"]
+    step4["4. Cerrar conexiones de red"]
+    step5["5. Terminar threads de trabajo"]
+    done([Sistema detenido])
+
+    start --> step1 --> step2 --> step3 --> step4 --> step5 --> done
 ```
 
 #### Script de Apagado
@@ -599,7 +589,6 @@ biblioteca. El benchmark eleva cada hilo a `SCHED_FIFO` 80, hace 20 000
 iteraciones de calentamiento y bloquea memoria; la línea `SCHED_FIFO: aplicado`
 confirma que las cifras son comparables. Consulte
 [BENCHMARKING.md](BENCHMARKING.md) para interpretar las cifras.
-
 
 ### 5.4 Rendimiento medido (referencia)
 
@@ -1368,7 +1357,6 @@ Cada módulo se asocia al maestro con `ChronosRT_et_master_attach_*()`. La
 transmisión puede usar llamadas al sistema (`sendmmsg`, hasta 16 tramas) o un
 anillo `PACKET_TX_RING`; selección con `ChronosRT_et_master_set_tx_mode()`.
 
-
 ### 11.2 Elegir el protocolo
 
 ```bash
@@ -1612,18 +1600,18 @@ int main(void) {
     // 2. Inicializar
     ChronosRT_handle_t handle;
     if (ChronosRT_init(&handle, &config) != ChronosRT_SUCCESS) {
-        fprintf(stderr, "Init failed\\n");
+        fprintf(stderr, "Init failed\n");
         return 1;
     }
     
-    printf("ChronosRT Master initialized successfully!\\n");
+    printf("ChronosRT Master initialized successfully!\n");
     
     // 3. Publicar eventos
     for (int i = 0; i < 100; i++) {
         uint32_t data = i;
         ChronosRT_event_publish(handle, &data, sizeof(data));
     }
-    printf("Published 100 events\\n");
+    printf("Published 100 events\n");
     
     // 4. Suscribirse a eventos
     ChronosRT_event_t event;
@@ -1634,11 +1622,11 @@ int main(void) {
             received++;
         }
     }
-    printf("Received %d events\\n", received);
+    printf("Received %d events\n", received);
     
     // 5. Shutdown
     ChronosRT_shutdown(handle);
-    printf("ChronosRT Master shutdown complete\\n");
+    printf("ChronosRT Master shutdown complete\n");
     
     return 0;
 }
@@ -1673,11 +1661,11 @@ int main(int argc, char* argv[]) {
     // Inicializar
     ChronosRT_handle_t handle;
     if (ChronosRT_init(&handle, &config) != ChronosRT_SUCCESS) {
-        fprintf(stderr, "Failed to initialize\\n");
+        fprintf(stderr, "Failed to initialize\n");
         return 1;
     }
     
-    printf("Running latency benchmark...\\n");
+    printf("Running latency benchmark...\n");
     
     // Ejecutar benchmark
     ChronosRT_metrics_t metrics;
@@ -1685,7 +1673,7 @@ int main(int argc, char* argv[]) {
                                         ChronosRT_MODE_LATENCY,
                                         30,  // 30 segundos
                                         &metrics) != ChronosRT_SUCCESS) {
-        fprintf(stderr, "Benchmark failed\\n");
+        fprintf(stderr, "Benchmark failed\n");
         ChronosRT_shutdown(handle);
         return 1;
     }
@@ -1695,14 +1683,14 @@ int main(int argc, char* argv[]) {
     
     // Evaluar resultado (el WCET manda sobre sigma)
     if (metrics.wcet_ns > CHRONOSRT_LATENCY_TARGET_NS) {
-        printf("✗ WCET > 10 μs: %lu picos de %lu eventos\\n",
+        printf("✗ WCET > 10 μs: %lu picos de %lu eventos\n",
                metrics.latency_spikes, metrics.total_events);
     } else if (metrics.stddev_ns < 1000) {
-        printf("✓ EXCELLENT: Jitter < 1 μs\\n");
+        printf("✓ EXCELLENT: Jitter < 1 μs\n");
     } else if (metrics.stddev_ns < 5000) {
-        printf("✓ GOOD: Jitter < 5 μs\\n");
+        printf("✓ GOOD: Jitter < 5 μs\n");
     } else {
-        printf("✗ NEEDS OPTIMIZATION: Jitter >= 5 μs\\n");
+        printf("✗ NEEDS OPTIMIZATION: Jitter >= 5 μs\n");
     }
     
     ChronosRT_shutdown(handle);
@@ -1737,7 +1725,7 @@ void* producer_thread(void* arg) {
         usleep(100);  // 100 μs entre eventos
     }
     
-    printf("Producer %d: published %lu events\\n", id, count);
+    printf("Producer %d: published %lu events\n", id, count);
     return NULL;
 }
 
@@ -1754,7 +1742,7 @@ void* consumer_thread(void* arg) {
         }
     }
     
-    printf("Consumer %d: received %lu events\\n", id, count);
+    printf("Consumer %d: received %lu events\n", id, count);
     return NULL;
 }
 
@@ -1861,7 +1849,7 @@ sudo ./chronosrt_bench
 sudo setcap cap_sys_nice=eip ./chronosrt_bench
 
 # O ajustar limits
-echo \"@user - rtprio 99\" >> /etc/security/limits.conf
+echo "@user - rtprio 99" >> /etc/security/limits.conf
 ```
 
 ### E.3 Problemas de Rendimiento
@@ -1878,12 +1866,12 @@ echo \"@user - rtprio 99\" >> /etc/security/limits.conf
 ```bash
 # Script de verificación rápida
 #!/bin/bash
-echo \"=== Quick Performance Check ===\"
-echo -n \"PREEMPT_RT: \"
-zcat /proc/config.gz 2>/dev/null | grep -q PREEMPT_RT && echo \"YES\" || echo \"NO\"
-echo -n \"CPU Governor: \"
+echo "=== Quick Performance Check ==="
+echo -n "PREEMPT_RT: "
+zcat /proc/config.gz 2>/dev/null | grep -q PREEMPT_RT && echo "YES" || echo "NO"
+echo -n "CPU Governor: "
 cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
-echo -n \"Hugepages: \"
+echo -n "Hugepages: "
 grep HugePages_Total /proc/meminfo | awk '{print $2}'
 ```
 
@@ -1943,12 +1931,3 @@ watch -n1 cat /sys/class/thermal/thermal_zone0/temp
 - **Stack Overflow:** Etiquetas [real-time], [embedded], [linux-kernel]
 - **Reddit:** r/embedded, r/linux, r/programming
 - **Linux Foundation Forums:** https://forums.linuxfoundation.org
-
----
-
-**Fin del Manual de Usuario**
-
-**Documento completado:** Noviembre 2026  
-**Próxima revisión:** Noviembre 2027  
-**Mantenido por:** Equipo de Desarrollo ChronosRT Master
-

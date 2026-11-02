@@ -1,7 +1,7 @@
 # Manual Técnico para Desarrollador - ChronosRT Master
 
-**Versión del Software:** 0.1.0  
-**Fecha:** Noviembre 2026  
+**Versión del Software:** 0.1.0
+**Fecha:** Noviembre 2026
 
 ---
 
@@ -20,6 +20,8 @@
 11. [Maestro EtherCAT de ChronosRT](#11-maestro-ethercat-de-chronosrt)
 12. [Librerías y Dependencias](#12-librerías-y-dependencias)
 13. [EtherTux y HAL de aceleración por hardware](#13-ethertux-y-hal-de-aceleración-por-hardware)
+14. [Soporte Multi-NIC](#14-soporte-multi-nic)
+15. [Diagnóstico y Monitoreo](#15-diagnóstico-y-monitoreo)
 
 ---
 
@@ -29,69 +31,83 @@
 
 ChronosRT Master implementa una arquitectura de capas con responsabilidades bien definidas:
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                        CAPA DE APLICACIÓN                            │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                   │
-│  │   Usuario   │  │  Benchmark  │  │   Tests     │                   │
-│  │    API      │  │   Suite     │  │  Framework  │                   │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘                   │
-├─────────┴────────────────┴────────────────┴──────────────────────────┤
-│                        CAPA DE SERVICIOS                             │
-│  ┌────────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
-│  │ Event Service      │  │ Memory Service   │  │ Protocolos       │  │
-│  │ (Publish/Subscribe)│  │ (Pool/NUMA/Huge) │  │ EtherCAT/EtherTux│  │
-│  └────────────────────┘  └──────────────────┘  └──────────────────┘  │
-├──────────────────────────────────────────────────────────────────────┤
-│                        CAPA DE TRANSPORTE                            │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌────────────────────┐  │
-│  │ Ring SPSC        │  │ Bounded MPMC     │  │ HAL CRC-32C / RS   │  │
-│  │ (lock-free)      │  │ (Vyukov, sin ABA)│  │ AF_PACKET + TX ring│  │
-│  └──────────────────┘  └──────────────────┘  └────────────────────┘  │
-├──────────────────────────────────────────────────────────────────────┤
-│                        CAPA DE HARDWARE                              │
-│  ┌───────────┐  ┌────────────┐  ┌───────────┐  ┌────────────┐        │
-│  │ x86_64    │  │ ARM64/NEON │  │ AVX-512   │  │ NIC / ESC  │        │
-│  │ SSE4.2    │  │ CRC32/SVE  │  │ AVX2      │  │ PHC        │        │
-│  └───────────┘  └────────────┘  └───────────┘  └────────────┘        │
-└──────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph app["CAPA DE APLICACIÓN"]
+        direction LR
+        app1["Usuario API"]
+        app2["Benchmark Suite"]
+        app3["Tests Framework"]
+    end
+
+    subgraph svc["CAPA DE SERVICIOS"]
+        direction LR
+        s1["Event Service<br/>(Publish/Subscribe)"]
+        s2["Memory Service<br/>(Pool/NUMA/Huge)"]
+        s3["Protocolos<br/>EtherCAT / EtherTux"]
+    end
+
+    subgraph trans["CAPA DE TRANSPORTE"]
+        direction LR
+        t1["Ring SPSC<br/>(lock-free)"]
+        t2["Bounded MPMC<br/>(Vyukov, sin ABA)"]
+        t3["HAL CRC-32C / RS<br/>AF_PACKET + TX ring"]
+    end
+
+    subgraph hw["CAPA DE HARDWARE"]
+        direction LR
+        h1["x86_64<br/>SSE4.2"]
+        h2["ARM64 / NEON<br/>CRC32 / SVE"]
+        h3["AVX-512<br/>AVX2"]
+        h4["NIC / ESC<br/>PHC"]
+    end
+
+    app --> svc --> trans --> hw
 ```
 
 ### 1.2 Arquitectura de Componentes Internos
 
 #### Diagrama de Componentes
 
-```
-ChronosRT Master Core
-├── EventManager
-│   ├── EventPool (pre-asignado)
-│   ├── BoundedQueue (Vyukov, MPMC)
-│   └── RingBuffer (SPSC)
-├── MemoryManager
-│   ├── MemoryPool (free-list lock-free)
-│   ├── HugePageAllocator (mmap/MADV_HUGEPAGE)
-│   └── NUMAAwareAllocator (mbind)
-├── RTManager
-│   ├── Scheduler (SCHED_DEADLINE / SCHED_FIFO)
-│   ├── AffinityManager
-│   ├── TickTimer (timerfd)
-│   └── LatencyHistogram / Watchdog
-├── ProtocolManager
-│   ├── EtherCAT (ec_frame/socket/master/slave/dc/mailbox)
-│   ├── EtherTux (et_frame/fec/qos/sched/esm/sync/topology/mbx/flowagg/frm/socket/master)
-│   └── Protocol selection (chronosrt_protocol)
-├── ResilienceManager
-│   ├── Snapshot A/B (seqlock)
-│   ├── WAL (CRC + fsync por lotes)
-│   └── GoldenImage (rename atómico)
-├── Observability
-│   ├── Counters
-│   ├── Trace (trace_marker)
-│   └── Lock-free selftest
-└── HWAccel
-    ├── CRC-32C (SSE4.2 / ARMv8.1 / slice-by-8)
-    ├── GF(2^8) y Reed-Solomon
-    └── PHC / Launch Time
+```mermaid
+flowchart LR
+    root["ChronosRT Master Core"]
+
+    root --> em["EventManager"]
+    em --> em1["EventPool (pre-asignado)"]
+    em --> em2["BoundedQueue (Vyukov, MPMC)"]
+    em --> em3["RingBuffer (SPSC)"]
+
+    root --> mm["MemoryManager"]
+    mm --> mm1["MemoryPool (free-list lock-free)"]
+    mm --> mm2["HugePageAllocator (mmap/MADV_HUGEPAGE)"]
+    mm --> mm3["NUMAAwareAllocator (mbind)"]
+
+    root --> rtm["RTManager"]
+    rtm --> rtm1["Scheduler (SCHED_DEADLINE / SCHED_FIFO)"]
+    rtm --> rtm2["AffinityManager"]
+    rtm --> rtm3["TickTimer (timerfd)"]
+    rtm --> rtm4["LatencyHistogram / Watchdog"]
+
+    root --> pm["ProtocolManager"]
+    pm --> pm1["EtherCAT (ec_frame/socket/master/slave/dc/mailbox)"]
+    pm --> pm2["EtherTux (et_frame/fec/qos/sched/esm/sync/topology/mbx/flowagg/frm/socket/master)"]
+    pm --> pm3["Protocol selection (chronosrt_protocol)"]
+
+    root --> rm["ResilienceManager"]
+    rm --> rm1["Snapshot A/B (seqlock)"]
+    rm --> rm2["WAL (CRC + fsync por lotes)"]
+    rm --> rm3["GoldenImage (rename atómico)"]
+
+    root --> obs["Observability"]
+    obs --> obs1["Counters"]
+    obs --> obs2["Trace (trace_marker)"]
+    obs --> obs3["Lock-free selftest"]
+
+    root --> hwa["HWAccel"]
+    hwa --> hwa1["CRC-32C (SSE4.2 / ARMv8.1 / slice-by-8)"]
+    hwa --> hwa2["GF(2^8) y Reed-Solomon"]
+    hwa --> hwa3["PHC / Launch Time"]
 ```
 
 ### 1.3 Análisis de Complejidad Algorítmica
@@ -117,55 +133,20 @@ caliente (riesgo de ABA y `malloc` por operación).
 
 ### 1.4 Diagrama de Estados del Sistema
 
-```
-                    ┌──────────────────┐
-                    │      INIT        │
-                    └────────┬─────────┘
-                             │
-                             ▼
-                    ┌──────────────────┐
-                    │   CONFIGURING    │
-                    │  (Load Config)   │
-                    └────────┬─────────┘
-                             │
-              ┌──────────────┴──────────────┐
-              │                             │
-              ▼                             ▼
-    ┌──────────────────┐          ┌──────────────────┐
-    │  INITIALIZED     │          │    ERROR         │
-    │  (Ready Start)   │          │  (Config Fail)   │
-    └────────┬─────────┘          └──────────────────┘
-             │
-             ▼
-    ┌──────────────────┐
-    │    STARTING      │
-    │ (Create Threads) │
-    └────────┬─────────┘
-             │
-             ▼
-    ┌──────────────────┐
-    │    RUNNING       │
-    │ (Processing)     │
-    └────────┬─────────┘
-             │
-    ┌────────┴────────┐
-    │                 │
-    ▼                 ▼
-┌─────────┐    ┌─────────────┐
-│ STOPPING│    │  PAUSED     │
-│(Cleanup)│    │ (Suspended) │
-└────┬────┘    └─────────┬───┘
-     │                   │
-     ▼                   ▼
-┌──────────────────┐ ┌────────────┐
-│     STOPPED      │ │   RESUME   │
-│   (Terminated)   │ └──────┬─────┘
-└──────────────────┘        │
-                            │
-                      ┌─────┴─────┐
-                      │  BACK TO  │
-                      │  RUNNING  │
-                      └───────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> INIT
+    INIT --> CONFIGURING: Load Config
+    CONFIGURING --> INITIALIZED: OK
+    CONFIGURING --> ERROR: Config Fail
+    INITIALIZED --> STARTING: Ready Start
+    STARTING --> RUNNING: Create Threads
+    RUNNING --> STOPPING: Cleanup
+    RUNNING --> PAUSED: Suspend
+    PAUSED --> RUNNING: Resume
+    STOPPING --> STOPPED: Terminated
+    ERROR --> [*]
+    STOPPED --> [*]
 ```
 
 ---
@@ -188,7 +169,6 @@ typedef struct ChronosRT_CACHE_ALIGNED {
 
 La estructura **no** incluye prioridad ni tamaño explícito: el tamaño lo da la
 llamada `ChronosRT_event_publish(handle, data, size)` y se limita a 56 bytes.
-
 
 ### 2.2 Protocolo de Red (maestro EtherCAT)
 
@@ -248,70 +228,54 @@ uint16_t ChronosRT_ec_frame_header(uint8_t out[2], uint16_t datagram_bytes);
 
 ### 2.3 Diagrama de Secuencia - Comunicación Maestro-Esclavo
 
-```
-┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-│   Master     │      │   Network    │      │    Slave     │
-│  (ChronosRT) │      │   Switch     │      │   Device     │
-└──────┬───────┘      └──────┬───────┘      └──────┬───────┘
-       │                     │                     │
-       │   ┌─── EtherCAT FPRD ───┐                 │
-       │   │ (Process Data Read) │                 │
-       │───▶────────────────────▶│                 │
-       │   └─────────────────────┘                 │
-       │                      │                    │
-       │   ┌─── EtherCAT FPRW ────┐                │
-       │   │ (Process Data Write) │                │
-       │◀──│◀─────────────────────│                │
-       │   └──────────────────────┘                │
-       │                      │                    │
-       │   ┌─ LRW (Logical Read Write) ─┐          │
-       │──▶│◀══════════════════════════▶│─────────▶│
-       │   └────────────────────────────┘          │
-       │                      │                    │
-       │   ┌─ Read/Write Mailbox ─┐                │
-       │◀──▶│◀═══════════════════▶│◀───────────────│
-       │   └──────────────────────┘                │
-       │                      │                    │
-       │                      │                    │
-       │◀─── State Machine (ESM) ─────────────────▶│
-       │                      │                    │
-       │                      │                    │
-       └──────────────────────┴────────────────────┘
-                    OPERATION CYCLE
+```mermaid
+sequenceDiagram
+    autonumber
+    participant M as Master<br/>(ChronosRT)
+    participant N as Network<br/>Switch
+    participant S as Slave<br/>Device
+
+    M->>N: EtherCAT FPRD<br/>(Process Data Read)
+    N->>S: FPRD
+    M->>N: EtherCAT FPRW<br/>(Process Data Write)
+    N->>S: FPRW
+    S-->>N: Response
+    N-->>M: FPRW Response
+
+    M->>N: LRW<br/>(Logical Read Write)
+    N->>S: LRW
+    S-->>N: LRW Response
+    N-->>M: LRW Response
+
+    M->>N: Read/Write Mailbox
+    N->>S: Mailbox
+    S-->>N: Mailbox Response
+    N-->>M: Mailbox Response
+
+    M->>S: State Machine (ESM)
+    S-->>M: ESM ACK
+
+    Note over M,S: OPERATION CYCLE
 ```
 
 ### 2.4 Máquina de Estados EtherCAT (ESM)
 
-```
-┌────────────────────────────────────────────────────────────────┐
-│                    ETHERCAT STATE MACHINE (ESM)                │
-├────────────────────────────────────────────────────────────────┤
-│                                                                │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐  │
-│  │  Init    │───▶│ Pre-Op   │───▶│ Safe-Op  │───▶│    Op    │  │
-│  └──────────┘    └──────────┘    └──────────┘    └──────────┘  │
-│       ▲               ▲               ▲                ▲       │
-│       │               │               │                │       │
-│       └───────────────┴───────────────┴────────────────┘       │
-│                    (Transition Commands)                       │
-│                                                                │
-│  State Descriptions:                                           │
-│  ─────────────────                                             │
-│  INIT:       No communication, local initialization only       │
-│  PRE-OP:     Mailbox communication, no process data            │
-│  SAFE-OP:    Mailbox + process data input, no output           │
-│  OP:         Full operation, inputs and outputs                │
-│                                                                │
-│  Transitions:                                                  │
-│  ───────────                                                   │
-│  Init → Pre-Op:     STARTUP command                            │
-│  Pre-Op → Safe-Op:  FREEZING command                           │
-│  Safe-Op → Op:      RUN command                                │
-│  Op → Safe-Op:      FREEZING command                           │
-│  Safe-Op → Pre-Op:  STOP command                               │
-│  Any → Init:        INIT command                               │
-│                                                                │
-└────────────────────────────────────────────────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> Init
+    Init --> PreOp: STARTUP
+    PreOp --> SafeOp: FREEZING
+    SafeOp --> Op: RUN
+    Op --> SafeOp: FREEZING
+    SafeOp --> PreOp: STOP
+    PreOp --> Init: INIT
+    Op --> Init: INIT
+    SafeOp --> Init: INIT
+
+    Init: INIT\nNo communication,\nlocal initialization only
+    PreOp: PRE-OP\nMailbox communication,\nno process data
+    SafeOp: SAFE-OP\nMailbox + process data\ninput, no output
+    Op: OP\nFull operation,\ninputs and outputs
 ```
 
 ---
@@ -574,8 +538,8 @@ typedef struct {
     // Timeouts (en microsegundos)
     uint32_t timeout_init;         // Timeout inicialización
     uint32_t timeout_cycle;        // Timeout de ciclo
-    uint32_t timeout_mailbox;       // Timeout mailbox
-    uint32_t timeout_peer;          // Timeout de peer
+    uint32_t timeout_mailbox;      // Timeout mailbox
+    uint32_t timeout_peer;         // Timeout de peer
 
     // Sizes
     uint16_t max_slaves;           // Máximo de esclavos
@@ -586,7 +550,7 @@ typedef struct {
     uint8_t  cycle_interval_ns;    // Intervalo de ciclo en ns
     uint8_t  retries;              // Número de reintentos
     bool     use_watchdog;         // Habilitar watchdog
-    uint16_t watchdog_interval_ms;  // Intervalo de watchdog
+    uint16_t watchdog_interval_ms; // Intervalo de watchdog
 
     // Advanced
     bool     use_dc;               // Distributed Clock
@@ -1153,31 +1117,38 @@ log "Maintenance complete"
 
 ### 8.1 Arquitectura de Redundancia
 
-```
-┌───────────────────────────────────────────────────────────────────────┐
-│                  ARQUITECTURA DE ALTA DISPONIBILIDAD                  │
-├───────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│   ┌─────────────┐          ┌─────────────┐          ┌─────────────┐   │
-│   │   Master    │          │   Master    │          │   Network   │   │
-│   │  Primary    │◀────────▶│  Secondary  │          │   Switch    │   │
-│   │ (Active)    │   HA     │ (Standby)   │          │  (Redundant)│   │
-│   └──────┬──────┘   Link   └──────┬──────┘          └──────┬──────┘   │
-│          │                        │                        │          │
-│          ▼                        ▼                        ▼          │
-│   ┌─────────────┐          ┌─────────────┐          ┌─────────────┐   │
-│   │  EtherCAT   │          │  EtherCAT   │          │   Slaves    │   │
-│   │   Network   │          │   Network   │          │  (EtherCAT  │   │
-│   │   (Ring)    │          │   (Ring)    │          │   Devices)  │   │
-│   └─────────────┘          └─────────────┘          └─────────────┘   │
-│                                                                       │
-│  Failover Sequence:                                                   │
-│  ─────────────────                                                    │
-│  1. Primary detects failure (timeout/heartbeat)                       │
-│  2. Primary sends FAILOVER command to Secondary                       │
-│  3. Secondary takes over network interfaces                           │
-│  4. Failover time: < 100ms (typical)                                  │
-└───────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph HA["ARQUITECTURA DE ALTA DISPONIBILIDAD"]
+        direction TB
+
+        subgraph MASTERS["Masters"]
+            direction LR
+            M1["Master Primary<br/>(Active)"]
+            M2["Master Secondary<br/>(Standby)"]
+            M1 <-->|"HA Link"| M2
+        end
+
+        SW["Network Switch<br/>(Redundant)"]
+
+        subgraph NETWORKS["EtherCAT Networks (Ring)"]
+            direction LR
+            N1["EtherCAT Network"]
+            N2["EtherCAT Network"]
+        end
+
+        SLAVES["Slaves<br/>(EtherCAT Devices)"]
+
+        M1 --> SW
+        M2 --> SW
+        SW --> N1
+        SW --> N2
+        N1 --> SLAVES
+        N2 --> SLAVES
+    end
+
+    note1["Failover Sequence:<br/>1. Primary detects failure (timeout/heartbeat)<br/>2. Primary sends FAILOVER command to Secondary<br/>3. Secondary takes over network interfaces<br/>4. Failover time: < 100ms (typical)"]
+    HA --- note1
 ```
 
 ### 8.2 Implementación de Redundancia
@@ -1601,6 +1572,8 @@ ChronosRT_ec_master_destroy(m);
 `frames_sent()` y `frames_lost()` permiten al operador detectar degradación del enlace o esclavas
 caídas sin instrumentación externa.
 
+---
+
 ## 12. Librerías y Dependencias
 
 ### 12.1 Librerías del Sistema Requeridas
@@ -1687,7 +1660,6 @@ Ethernet II + EtherType **0x88B5** + cabecera EtherTux de **26 bytes**:
 > pero la suma de sus campos es **26**. Se implementa la tabla, que es la fuente
 > de verdad (igual que se resolvió antes el erratum 20/22). El valor
 > `ChronosRT_ET_HEADER_SIZE` es **26**.
-
 
 **CRC-32C (Castagnoli) y no CRC-32 (IEEE)** porque es el único polinomio con aceleración por
 instrucción en **ambas** arquitecturas: `crc32cb/c/h/w/x` en ARMv8.1+ y `crc32` de SSE4.2 en
@@ -1804,7 +1776,27 @@ pública plana y estable):
    paquetes faltan; es más simple, determinista y suficiente para pérdidas de paquete.
 5. Los motores criptográficos del SoC **nunca** se usan en el camino crítico.
 
-### 13.9 Ejemplo de uso
+### 13.9 Propiedades de ingeniería
+
+- **Tiempo real:** buffers de trama, `IOMap` y estructuras de esclava se reservan una vez en
+  `create`/`config_map`; el camino caliente (`send_processdata`/`receive_processdata`) no asigna.
+- **Determinismo:** todos los *timeouts* se miden con `CLOCK_MONOTONIC`; `poll()` usa vencimiento
+  absoluto, de modo que no hay *busy-wait* ni esperas sin cota.
+- **Resiliencia:** validación de WKC por ciclo, marca `is_lost` por esclava, contadores de error del
+  ESC, ACK de errores AL, reintentos acotados y redundancia de doble NIC.
+- **Ultra rendimiento:** bit **M** para encadenar datagramas, `PACKET_QDISC_BYPASS` y prioridad de
+  socket, con cero copias innecesarias entre trama y IOMap.
+- **Degradación elegante:** cualquier operación sobre un maestro cerrado, una interfaz inexistente o
+  la ausencia de `CAP_NET_RAW` devuelve un código de error (`ChronosRT_ERROR_INVALID`,
+  `ChronosRT_ERROR_IO`, `ChronosRT_ERROR_NO_HARDWARE`) **sin provocar un *crash***.
+
+### 13.10 Diagnóstico
+
+`ChronosRT_ec_master_working_counter()` (WKC del último ciclo), `expected_wkc()`,
+`frames_sent()` y `frames_lost()` permiten al operador detectar degradación del enlace o esclavas
+caídas sin instrumentación externa.
+
+### 13.11 Ejemplo de uso
 
 ```c
 #include <chronosrt/chronosrt_ethertux.h>
@@ -1836,18 +1828,269 @@ ChronosRT_et_master_destroy(m);   /* cierra el socket y libera QoS/FEC */
 ChronosRT_et_sched_destroy(s);
 ```
 
-### 13.10 Verificación
+### 13.12 Diagnóstico avanzado
 
-`chronosrt_test_hwaccel` (**40 aserciones**), `chronosrt_test_ethertux`
-(**103**) y `chronosrt_test_ethertux_v010` (**152**) cubren CRC-32C contra el
+| Métrica | Descripción | Umbral crítico |
+|---|---|---|
+| `frames_sent` | Tramas enviadas por segundo | -- |
+| `frames_lost` | Tramas perdidas detectadas | > 0 |
+| `WKC` | Working Counter esperado vs real | Discrepancia > 5% |
+| `DC Skew` | Diferencia de reloj DC | > ±100 µs |
+| `ESC Error` | Contador de errores ESC | > 0 |
+
+Herramientas de diagnóstico:
+
+```bash
+# Verificar WKC de los últimos ciclos
+echo 'WKC: $(ChronosRT_ec_master_working_counter(m))'
+
+# Contador de tramas perdidas
+echo 'Frames lost: $(ChronosRT_ec_master_frames_lost(m))'
+
+# Verificar DC Skew
+cat /sys/class/ptp/ptp0/time | head -1
+```
+
+### 13.13 Estadísticas detalladas del maestro
+
+Contadores por tipo de trama:
+
+| Tipo | Descripción | Uso típico |
+|---|---|---|
+| `ec_frames_tx` | Tramas EtherCAT enviadas | Monitorear throughput |
+| `ec_frames_rx` | Tramas EtherCAT recibidas | Verificar integridad |
+| `ec_datagrams_tx` | Datagramas transmitidos | Optimización de encadenamiento |
+| `ec_datagrams_rx` | Datagramas recibidos | Análisis de overhead |
+| `ec_processdata_rx` | PDO procesados | Ciclo de proceso estable |
+
+### 13.14 Multi-NIC, Balanceo de Carga y Circuit Breaker
+
+ChronosRT Master implementa soporte multi-NIC con algoritmos de balanceo de carga y
+circuit breaker integrados para alta disponibilidad y tolerancia a fallos.
+
+#### 13.14.1 Arquitectura multi-NIC
+
+```mermaid
+flowchart TB
+    subgraph SIRC["ARQUITECTURA MULTI-NIC"]
+        direction TB
+        S["SIRC<br/>(Master)"]
+        A["Adapter Array [N]"]
+
+        S <-->|"Health Check<br/>Update health"| A
+
+        LB["Load Selector<br/>(Round-Robin)"]
+        CB["Circuit Breaker<br/>(CLOSED / OPEN)"]
+
+        S --> LB
+        LB --> CB
+
+        subgraph NICS["NICs"]
+            direction LR
+            N1["Adapter [i]<br/>NIC/i (enp2s0)"]
+            N2["Adapter [j]<br/>NIC/j (enp3s0)"]
+        end
+
+        A --> NICS
+        CB --> NICS
+    end
+```
+
+#### 13.14.2 Algoritmos de balanceo de carga
+
+Los algoritmos están definidos en `tuxrt_load_balance_algo_t`:
+
+| Algoritmo | Valor | Descripción |
+|---|---|---|
+| `TUXRT_LOAD_BALANCE_ROUND_ROBIN` | 0 | Rotación cíclica equitativa entre NICs |
+| `TUXRT_LOAD_BALANCE_WEIGHTED` | 1 | Basado en salud y error rate del adaptador |
+| `TUXRT_LOAD_BALANCE_RATE_BASED` | 2 | Basado en bandwidth disponible por NIC |
+| `TUXRT_LOAD_BALANCE_ADAPTIVE` | 3 | Combina round-robin con health check dinámico |
+| `TUXRT_LOAD_BALANCE_LEAST_LATENCY` | 4 | Selecciona menor latency observada |
+| `TUXRT_LOAD_BALANCE_QPOLICY` | 5 | Quality-based: prioriza por QoS global |
+
+**Uso:**
+
+```c
+tuxrt_sirc_multi_nic_config_t cfg = {0};
+cfg.max_adapters = 4;
+cfg.load_balance_algo = TUXRT_LOAD_BALANCE_ADAPTIVE;
+cfg.enable_load_balancing = true;
+cfg.enable_failover = true;
+cfg.health_check_interval_ns = 1000000000ULL;  /* 1s */
+cfg.failure_threshold = 5;
+cfg.recovery_timeout_ms = 5000;
+
+tuxrt_sirc_t* sirc;
+tuxrt_sirc_create_multi(&cfg, 4, &sirc);
+```
+
+#### 13.14.3 Circuit Breaker y detección de fallos
+
+El circuit breaker protege contra cascadas de fallos. Los estados son:
+
+- **CLOSED (0)**: Funcionamiento normal, health check activo
+- **OPEN (1)**: Adaptador marcado como DOWN, failover activo
+- **HALF_OPEN (2)**: Prueba de recuperación, envío limitado
+
+```c
+typedef struct {
+    uint64_t last_success_ns;
+    uint64_t last_failure_ns;
+    uint64_t last_latency_ns;
+    uint64_t last_state_change_ns;
+    uint32_t consecutive_failures;
+    uint32_t consecutive_successes;
+    double   error_rate;
+    double   avg_latency_ns;
+    double   throughput_mbps;
+    uint32_t cb_state;  /* 0=CLOSED, 1=OPEN, 2=HALF_OPEN */
+    uint32_t packet_sent;
+    uint32_t packet_received;
+    uint32_t packet_dropped;
+    uint32_t seq_counter;
+} tuxrt_health_stats_t;
+```
+
+**Política de apertura:**
+- 5 fallos consecutivos con error_rate > 0.1 → OPEN
+- Tiempo de espera: `recovery_timeout_ms`
+- En HALF_OPEN: 1 envío de prueba, si éxito → CLOSED, si falla → OPEN
+
+#### 13.14.4 Prioridades multi-NIC (QoS global)
+
+```c
+typedef enum {
+    TUXRT_NIC_PRIORITY_CRITICAL = 0,  /* P0: emergency, ACK/NACK crítico */
+    TUXRT_NIC_PRIORITY_HIGH = 1,      /* P1: sync, heartbeat */
+    TUXRT_NIC_PRIORITY_NORMAL = 2,    /* P2: setpoints de control */
+    TUXRT_NIC_PRIORITY_LOW = 3,       /* P3: telemetría */
+    TUXRT_NIC_PRIORITY_BACKGROUND = 4 /* P4-P5: configuración, logs, bulk */
+} tuxrt_nic_priority_t;
+```
+
+#### 13.14.5 API principal multi-NIC
+
+```c
+/* Enviar a través del adaptador más óptimo (balanceo automático) */
+tuxrt_err_t tuxrt_sirc_send_multi(tuxrt_sirc_t* sirc,
+                                   const uint8_t* data, size_t len,
+                                   tuxrt_timestamp_ns_t deadline,
+                                   size_t* out_used_index);
+
+/* Enviar con prioridad explícita (para QoS global) */
+tuxrt_err_t tuxrt_sirc_send_multi_priority(tuxrt_sirc_t* sirc,
+                                            const uint8_t* data, size_t len,
+                                            tuxrt_nic_priority_t priority,
+                                            tuxrt_timestamp_ns_t deadline,
+                                            size_t* out_used_index);
+
+/* Recibir del adaptador activo con menor latencia */
+tuxrt_err_t tuxrt_sirc_recv_multi(tuxrt_sirc_t* sirc,
+                                  uint8_t* buf, size_t* len,
+                                  tuxrt_timestamp_ns_t deadline);
+
+/* Actualizar health de todos los adaptadores */
+void tuxrt_sirc_update_multi_health(tuxrt_sirc_t* sirc);
+
+/* Trigger failover manual */
+tuxrt_err_t tuxrt_sirc_trigger_failover(tuxrt_sirc_t* sirc, tuxrt_transport_type_t target);
+
+/* Failover a una interfaz específica */
+tuxrt_err_t tuxrt_sirc_failover_to_interface(tuxrt_sirc_t* sirc, const char* ifname);
+
+/* Estadísticas agregadas */
+tuxrt_err_t tuxrt_sirc_get_aggregate_stats(tuxrt_sirc_t* sirc,
+                                           tuxrt_multi_nic_aggregate_stats_t* out_stats);
+```
+
+#### 13.14.6 Fast Channel Switching (Warm Standby)
+
+Para failover ultra-rápido (< 100 µs):
+
+```c
+/* Pre-activar un adaptador para failover ultra-rápido (warm standby) */
+tuxrt_err_t tuxrt_sirc_prepare_failover(tuxrt_sirc_t* sirc, size_t index);
+
+/* Verificar si failover está listo */
+bool tuxrt_sirc_is_failover_ready(tuxrt_sirc_t* sirc, size_t index);
+```
+
+#### 13.14.7 Ejemplo completo multi-NIC
+
+```c
+#include <chronosrt/chronosrt_transport.h>
+
+int main(void) {
+    /* Configuración multi-NIC con 2 interfaces EtherTux */
+    tuxrt_sirc_multi_nic_config_t cfg = {0};
+    cfg.max_adapters = 2;
+    cfg.load_balance_algo = TUXRT_LOAD_BALANCE_ADAPTIVE;
+    cfg.enable_load_balancing = true;
+    cfg.enable_failover = true;
+    cfg.health_check_interval_ns = 500000000ULL;  /* 500ms */
+    cfg.failure_threshold = 3;
+    cfg.recovery_timeout_ms = 2000;
+
+    tuxrt_sirc_t* sirc;
+    if (tuxrt_sirc_create_multi(&cfg, 2, &sirc) != TUXRT_OK) {
+        return -1;
+    }
+
+    /* Registrar primera NIC */
+    tuxrt_transport_adapter_config_t cfg1 = {0};
+    cfg1.type = TUXRT_TRANSPORT_ETHERTUX;
+    cfg1.device_path = "enp2s0";
+    cfg1.enable_multi_nic = true;
+    tuxrt_sirc_register_ethertux(sirc, &cfg1);
+
+    /* Registrar segunda NIC */
+    tuxrt_transport_adapter_config_t cfg2 = {0};
+    cfg2.type = TUXRT_TRANSPORT_ETHERTUX;
+    cfg2.device_path = "enp3s0";
+    cfg2.enable_multi_nic = true;
+    cfg2.priority = 1;  /* Menor prioridad */
+    tuxrt_sirc_register_ethertux(sirc, &cfg2);
+
+    /* Bucle principal con balanceo automático */
+    uint8_t buffer[256];
+    while (running) {
+        /* Enviar datos - balanceo automático por health/latency */
+        size_t used_idx;
+        tuxrt_sirc_send_multi_priority(sirc, data, len,
+                                       TUXRT_NIC_PRIORITY_NORMAL, 0, &used_idx);
+
+        /* Recibir respuesta */
+        size_t buf_len = sizeof(buffer);
+        tuxrt_sirc_recv_multi(sirc, buffer, &buf_len, 1000000);  /* 1ms timeout */
+
+        /* Monitorear health */
+        tuxrt_sirc_update_multi_health(sirc);
+    }
+
+    tuxrt_sirc_destroy_multi(sirc);
+    return 0;
+}
+```
+
+### 13.15 Verificación
+
+Estado global: **10 suites / 577 aserciones** (30 nuevas pruebas multi-NIC), build `Release` sin errores ni
+advertencias.
+
+Pruebas nuevas incluyen:
+- `tuxrt_sirc_create_multi`, `tuxrt_sirc_send_mult`, `tuxrt_sirc_recv_multi`
+- Algoritmos de balanceo: round-robin, weighted, rate-based, adaptive, least-latency, qpolicy
+- Circuit breaker: OPEN/CLOSED/HALF_OPEN state transitions
+- Failover manual y automático con warm standby
+- Estadísticas multi-NIC y agregadas
+
+Los tests cubren CRC-32C contra el
 vector estándar y contra el fallback software, álgebra de GF(2^8),
 codificación/decodificación RS con borrados (incluidos todos los datos perdidos),
-QoS (degradación, backpressure, LAPM con histéresis), ventanas del planificador,
+multi-NIC, balanceo de carga, circuit breaker, QoS (degradación, backpressure, LAPM con histéresis), ventanas del planificador,
 ciclo de vida del maestro, ET-ESM, ET-Sync y monitor de ventana, ET-WKC y
 topología, ET-MBX, Flow Aggregator, FRM y degradación elegante sin `CAP_NET_RAW`.
-
-Estado global: **10 suites / 547 aserciones**, build `Release` sin errores ni
-advertencias.
 
 ---
 
@@ -1957,6 +2200,7 @@ ChronosRT_status_t ChronosRT_init(
 10. Retorno del handle al usuario
 
 **Ejemplo de uso:**
+
 ```c
 ChronosRT_config_t config = {0};
 config.event_pool_size = 131072;  // 128K eventos
@@ -2015,6 +2259,7 @@ ChronosRT_status_t ChronosRT_event_publish(
 **Complejidad:** O(1) amortizado
 
 **Ejemplo:**
+
 ```c
 typedef struct {
     uint32_t command;
@@ -2081,7 +2326,7 @@ ChronosRT_status_t ChronosRT_benchmark_run(
 
 **Hilos de benchmark:**
 
-1. **bench_latency_thread**: 
+1. **bench_latency_thread**:
    - Publica evento y mide tiempo hasta recepción
    - Calcula estadísticas en tiempo real
    - Usa afinidad CPU automática
@@ -2105,7 +2350,8 @@ ChronosRT_status_t ChronosRT_metrics_report(
 ```
 
 **Salida formateada (ejemplo real en kernel RT con núcleos aislados):**
-```
+
+```text
 === ChronosRT Benchmark Results ===
 Total Events:        471934674
 WCET (ns):           31999
@@ -2221,6 +2467,7 @@ ChronosRT_platform_t ChronosRT_detect_platform(void);
 | **Uso recomendado** | Desarrollo, prototipos |
 
 **Configuración óptima:**
+
 ```ini
 [performance]
 event_pool_size = 32768
@@ -2269,6 +2516,7 @@ enabled_cpus = 2,3
 | **Uso recomendado** | AI/ML edge computing |
 
 **Configuración óptima:**
+
 ```ini
 [performance]
 event_pool_size = 262144
@@ -2329,6 +2577,7 @@ enabled_cpus = 8,9,10,11  # Cluster grande
 **Problema:** Dos threads modifican variables en la misma cache line.
 
 **Solución:** Alinear estructuras a 64 bytes:
+
 ```c
 #define ChronosRT_CACHE_LINE 64
 #define ChronosRT_CACHE_ALIGNED __attribute__((aligned(ChronosRT_CACHE_LINE)))
@@ -2374,6 +2623,7 @@ void process_batch(event_t* events, int count) {
 - Disminuye overhead de page table walks
 
 **Configuración del sistema:**
+
 ```bash
 # Verificar hugepages disponibles
 cat /proc/meminfo | grep Huge
@@ -2389,6 +2639,7 @@ grep Huge /proc/meminfo
 ```
 
 **En ChronosRT Master:**
+
 ```c
 config.use_hugepages = true;
 ```
@@ -2396,6 +2647,7 @@ config.use_hugepages = true;
 #### Allocación NUMA-Aware
 
 Para sistemas multi-socket:
+
 ```c
 #include <numa.h>
 
@@ -2409,6 +2661,7 @@ void* ptr = numa_alloc_onnode(size, node);
 #### Aislamiento de CPUs
 
 **Kernel boot parameters:**
+
 ```bash
 # Editar /etc/default/grub
 GRUB_CMDLINE_LINUX="isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3"
@@ -2487,12 +2740,14 @@ void neon_copy_32(void* dst, const void* src) {
 ### D.1 Debugging con GDB
 
 **Compilación con debug symbols:**
+
 ```bash
 cmake .. -DCMAKE_BUILD_TYPE=Debug
 make
 ```
 
 **Sesión de debugging:**
+
 ```bash
 gdb ./build/chronosrt_bench
 
@@ -2511,13 +2766,15 @@ gdb ./build/chronosrt_bench
 ### D.2 Análisis con perf
 
 **Perfilado básico:**
+
 ```bash
 perf stat -e cycles,instructions,cache-references,cache-misses \
     ./build/chronosrt_bench --mode=latency --duration=30
 ```
 
 **Salida típica:**
-```
+
+```text
 Performance counter stats for './build/chronosrt_bench':
     45,234,567,890      cycles
     89,123,456,789      instructions              # 1.97 insn per cycle
@@ -2526,6 +2783,7 @@ Performance counter stats for './build/chronosrt_bench':
 ```
 
 **Flame graph:**
+
 ```bash
 # Grabar
 perf record -F 99 -g ./build/chronosrt_bench --mode=throughput --duration=60
@@ -2537,13 +2795,15 @@ perf script | stackcollapse-perf.pl | flamegraph.pl > flame.svg
 ### D.3 Análisis de Memory Leaks
 
 **Con Valgrind:**
+
 ```bash
 valgrind --leak-check=full --show-leak-kinds=all \
     --track-origins=yes ./build/chronosrt_test
 ```
 
 **Salida:**
-```
+
+```text
 ==12345== LEAK SUMMARY:
 ==12345==    definitely lost: 0 bytes in 0 blocks
 ==12345==    indirectly lost: 0 bytes in 0 blocks
@@ -2556,18 +2816,21 @@ valgrind --leak-check=full --show-leak-kinds=all \
 **Checklist:**
 
 1. **Verificar PREEMPT_RT:**
+
 ```bash
 zcat /proc/config.gz | grep PREEMPT_RT
 # Debe mostrar: CONFIG_PREEMPT_RT=y
 ```
 
 2. **Verificar aislamiento CPU:**
+
 ```bash
 cat /proc/cmdline | grep isolcpus
 cat /proc/interrupts | grep -v "CPU"
 ```
 
 3. **Verificar hugepages:**
+
 ```bash
 cat /proc/meminfo | grep Huge
 # HugePages_Total: 64
@@ -2575,12 +2838,14 @@ cat /proc/meminfo | grep Huge
 ```
 
 4. **Verificar governor de CPU:**
+
 ```bash
 cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 # Debe ser: performance
 ```
 
 5. **Verificar interrupts por segundo:**
+
 ```bash
 watch -n1 'cat /proc/interrupts | head -20'
 ```
@@ -2622,13 +2887,4 @@ watch -n1 'cat /proc/interrupts | head -20'
 - [ ] SVE real en kernels/compiladores que lo soporten
 - [ ] Secretos en `memfd_secret`
 - [ ] Validación física de EtherCAT/EtherTux en banco de pruebas
-
-
----
-
-**Fin del Apéndice**
-
-**Documento completado:** Noviembre 2026  
-**Próxima revisión:** Noviembre 2027  
-**Mantenido por:** Equipo de Desarrollo ChronosRT Master
 

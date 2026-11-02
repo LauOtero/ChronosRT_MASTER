@@ -45,35 +45,27 @@ cada plataforma con `chronosrt_bench` y `rtla`/`cyclictest`.
 
 ## 3. Vista de componentes
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                         Aplicación (C11)                             │
-│         init/shutdown · eventos · benchmark · métricas               │
-├──────────────────────────────────────────────────────────────────────┤
-│                     Superficie pública (ABI C)                       │
-│  chronosrt.h · kernel · sched · rt · mem · ring · mpmc · bounded     │
-│  resilience · obs · simd · hwaccel · protocol · ethercat · ethertux  │
-├──────────────────────────────────────────────────────────────────────┤
-│                      Protocolos (mutuamente excluyentes)             │
-│  ┌─────────────────────────┐   ┌─────────────────────────────────┐   │
-│  │ EtherCAT  (0x88A4)      │   │ EtherTux  (0x88B5)              │   │
-│  │ ec_frame/socket/master  │   │ et_frame/fec/qos/sched/esm      │   │
-│  │ ec_slave/dc/mailbox     │   │ et_sync/topology/mbx/flowagg/frm│   │
-│  │                         │   │ et_socket/master                │   │
-│  └─────────────────────────┘   └─────────────────────────────────┘   │
-├──────────────────────────────────────────────────────────────────────┤
-│                       Runtime y servicios                            │
-│  eventos · pools · SCHED_* · histograma/watchdog · resiliencia · obs │
-├──────────────────────────────────────────────────────────────────────┤
-│                  HAL de aceleración (runtime)                        │
-│  CRC-32C (SSE4.2 / ARMv8.1 / slice-by-8) · RS SIMD · PHC/LaunchTime  │
-├──────────────────────────────────────────────────────────────────────┤
-│                 Plataforma: detección de kernel                      │
-│  versión · PREEMPT_RT · isolcpus/nohz_full/rcu_nocbs · EEVDF         │
-│  sched_ext · io_uring · AF_XDP · SCHED_DEADLINE · memfd_secret       │
-├──────────────────────────────────────────────────────────────────────┤
-│              Kernel Linux 5.15+ … 7.x · NIC · SBC/MCU                │
-└──────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    app["Aplicación (C11)<br/>init/shutdown · eventos · benchmark · métricas"]
+
+    api["Superficie pública (ABI C)<br/>chronosrt.h · kernel · sched · rt · mem · ring · mpmc · bounded<br/>resilience · obs · simd · hwaccel · protocol · ethercat · ethertux"]
+
+    subgraph protocols["Protocolos (mutuamente excluyentes)"]
+        direction LR
+        ec["EtherCAT (0x88A4)<br/>ec_frame/socket/master<br/>ec_slave/dc/mailbox"]
+        et["EtherTux (0x88B5)<br/>et_frame/fec/qos/sched/esm<br/>et_sync/topology/mbx/flowagg/frm<br/>et_socket/master"]
+    end
+
+    runtime["Runtime y servicios<br/>eventos · pools · SCHED_* · histograma/watchdog · resiliencia · obs"]
+
+    hal["HAL de aceleración (runtime)<br/>CRC-32C (SSE4.2 / ARMv8.1 / slice-by-8) · RS SIMD · PHC/LaunchTime"]
+
+    platform["Plataforma: detección de kernel<br/>versión · PREEMPT_RT · isolcpus/nohz_full/rcu_nocbs · EEVDF<br/>sched_ext · io_uring · AF_XDP · SCHED_DEADLINE · memfd_secret"]
+
+    kernel["Kernel Linux 5.15+ … 7.x · NIC · SBC/MCU"]
+
+    app --> api --> protocols --> runtime --> hal --> platform --> kernel
 ```
 
 ---
@@ -474,3 +466,31 @@ Resultado en el host de referencia:
 Los detalles de protocolo están en el [Manual Técnico §11](MANUAL_TECNICO.md)
 (EtherCAT) y §13 (EtherTux); las mediciones, en
 [BENCHMARKING.md](BENCHMARKING.md).
+
+---
+
+## Apéndice: Conversiones Mermaid y funcionalidades Markdown
+
+### A.1 Diagrama convertido a Mermaid
+
+| Sección | Diagrama original | Tipo Mermaid aplicado |
+|---------|-------------------|----------------------|
+| **3** | Vista de componentes (bloque ASCII de capas con sub-bloques EtherCAT / EtherTux) | `flowchart TB` con `subgraph` para los protocolos mutuamente excluyentes y flujo vertical entre las 7 capas |
+
+### A.2 Funcionalidades Markdown presentes
+
+- **Encabezados** (`#`, `##`, `###`, `####`) — 16 secciones + Apéndice A
+- **Tablas alineadas** (`---:`, `:---:`) en rendimiento, complejidad, módulos, verificación
+- **Bloques de código** con lenguajes (`c`, `bash`)
+- **Citas / blockquote** (`>`) para notas metodológicas (sección 2)
+- **Listas ordenadas y no ordenadas** (principios EtherTux, integración TuxRT)
+- **Enlaces internos** (TOC implícito por secciones numeradas, referencias cruzadas a `MANUAL_TECNICO.md` y `BENCHMARKING.md`)
+- **Enlaces externos** a documentos del proyecto
+- **Negritas / cursivas** (`**...**`, `*...*`) a lo largo de todo el texto
+- **Mermaid** (1 diagrama de componentes convertido)
+- **Separadores horizontales** (`---`) entre secciones
+- **Alineación numérica** en tablas de coste y aserciones
+- **Notas al pie** mediante blockquote en §2 sobre las métricas de latencia
+- **Subíndices** de complejidad (`O(1)`, `O(n)`, `O(k)`, `O(slots)`) en tablas
+- **Referencias inline** con `code` para símbolos, rutas y APIs
+

@@ -1,1544 +1,2923 @@
-# ChronosRT Master — Referencia de API
+# Manual Técnico para Desarrollador - ChronosRT Master
 
-**Versión:** 0.1.0 · **ABI:** `0x000100` · **SONAME:** `libchronosrt.so.0` · **Lenguaje:** C11
-
-## Convenciones
-
-- Cabecera de inclusión plana: `#include <chronosrt/chronosrt.h>` (el directorio
-  `include/chronosrt` se instala como tal).
-- Todos los símbolos públicos usan el prefijo `ChronosRT_` y la macro de visibilidad
-  `CHRONOSRT_API`; la biblioteca se compila con `-fvisibility=hidden`.
-- Enlace: `-lchronosrt -lpthread -lm -ldl`.
-- Las funciones que devuelven `int` usan `>= 0` para éxito (a menudo el número de
-  esclavas/nodos afectados) y `< 0`/`-1` para error, salvo que se indique otra cosa.
-- La API es **estable**: solo se añade al final, nunca se rompe el ABI.
+**Versión del Software:** 0.1.0
+**Fecha:** Noviembre 2026
 
 ---
 
-## 1. Códigos de estado
+## Tabla de Contenidos
 
-`ChronosRT_status_t` (`chronosrt.h`):
-
-| Código | Valor | Descripción |
-|---|---:|---|
-| `ChronosRT_SUCCESS` | 0 | Operación exitosa |
-| `ChronosRT_ERROR_INIT` | -1 | Error de inicialización |
-| `ChronosRT_ERROR_MEMORY` | -2 | Error de asignación de memoria |
-| `ChronosRT_ERROR_CPU` | -3 | Error de configuración de CPU |
-| `ChronosRT_ERROR_TIMEOUT` | -4 | Timeout |
-| `ChronosRT_ERROR_INVALID` | -5 | Parámetros inválidos |
-| `ChronosRT_ERROR_NO_HARDWARE` | -6 | Hardware no soportado |
-| `ChronosRT_ERROR_NOTSUP` | -7 | Operación no soportada en este kernel/HW |
-| `ChronosRT_ERROR_STATE` | -8 | Estado inválido para la operación |
-| `ChronosRT_ERROR_IO` | -9 | Error de E/S |
-| `ChronosRT_ERROR_CORRUPT` | -10 | Corrupción de integridad (CRC/ECC) |
-| `ChronosRT_ERROR_FULL` | -11 | Recurso lleno (cola/ring) |
-| `ChronosRT_ERROR_BACKPRESSURE` | -12 | El productor debe reducir la tasa (QoS P0–P4) |
-| `ChronosRT_ERROR_DROPPED` | -13 | Trama descartada por política best-effort (P5) |
-| `ChronosRT_ERROR_NOTFOUND` | -14 | Nodo/flujo/canal no registrado |
+1. [Arquitectura del Sistema](#1-arquitectura-del-sistema)
+2. [Protocolos de Comunicación](#2-protocolos-de-comunicación)
+3. [Gestión de Esclavos](#3-gestión-de-esclavos)
+4. [Configuración Avanzada de Comunicación](#4-configuración-avanzada-de-comunicación)
+5. [API de Desarrollo](#5-api-de-desarrollo)
+6. [Debugging y Logging](#6-debugging-y-logging)
+7. [Actualización y Mantenimiento](#7-actualización-y-mantenimiento)
+8. [Redundancia y Alta Disponibilidad](#8-redundancia-y-alta-disponibilidad)
+9. [Análisis de Rendimiento y Optimización](#9-análisis-de-rendimiento-y-optimización)
+10. [Seguridad y Cifrado](#10-seguridad-y-cifrado)
+11. [Maestro EtherCAT de ChronosRT](#11-maestro-ethercat-de-chronosrt)
+12. [Librerías y Dependencias](#12-librerías-y-dependencias)
+13. [EtherTux y HAL de aceleración por hardware](#13-ethertux-y-hal-de-aceleración-por-hardware)
+14. [Soporte Multi-NIC](#14-soporte-multi-nic)
+15. [Diagnóstico y Monitoreo](#15-diagnóstico-y-monitoreo)
 
 ---
 
-## 2. Núcleo: ciclo de vida, eventos y métricas
+## 1. Arquitectura del Sistema
 
-Cabecera: `chronosrt/chronosrt.h`.
+### 1.1 Vista General de la Arquitectura
 
-### 2.1 Configuración
+ChronosRT Master implementa una arquitectura de capas con responsabilidades bien definidas:
 
-```c
-typedef struct {
-    uint32_t enabled_cpus[ChronosRT_MAX_CPUS];  /* ChronosRT_MAX_CPUS = 16 */
-    uint32_t num_cpus;
-    uint32_t event_pool_size;
-    uint32_t batch_size;
-    uint32_t stack_size_kb;
-    bool     use_hugepages;
-    bool     use_numa_aware;
-    bool     use_simd;
-    bool     use_cpu_affinity;
-    ChronosRT_platform_t platform;
+```mermaid
+flowchart TB
+    subgraph app["CAPA DE APLICACIÓN"]
+        direction LR
+        app1["Usuario API"]
+        app2["Benchmark Suite"]
+        app3["Tests Framework"]
+    end
 
-    /* Extensiones ABI v1 (F2–F7) */
-    bool     lock_memory;          /* mlockall + prefault (RT-3)            */
-    bool     use_hugepages_2mb;    /* MADV_HUGEPAGE en el pool (RT-3)       */
-    bool     strict_isolation;     /* exigir isolcpus/nohz_full/rcu_nocbs   */
-    bool     use_deadline;         /* SCHED_DEADLINE para hilos RT (RT-1)   */
-    bool     use_bounded_mpmc;     /* cola bounded Vyukov (PF-3)            */
-    bool     use_timerfd;          /* tick por timerfd en vez de usleep     */
-    uint32_t rt_priority;          /* prioridad SCHED_FIFO (0 = auto)       */
-    uint64_t deadline_runtime_ns;  /* presupuesto de ejecución              */
-    uint64_t deadline_period_ns;   /* periodo                               */
-} ChronosRT_config_t;
+    subgraph svc["CAPA DE SERVICIOS"]
+        direction LR
+        s1["Event Service<br/>(Publish/Subscribe)"]
+        s2["Memory Service<br/>(Pool/NUMA/Huge)"]
+        s3["Protocolos<br/>EtherCAT / EtherTux"]
+    end
+
+    subgraph trans["CAPA DE TRANSPORTE"]
+        direction LR
+        t1["Ring SPSC<br/>(lock-free)"]
+        t2["Bounded MPMC<br/>(Vyukov, sin ABA)"]
+        t3["HAL CRC-32C / RS<br/>AF_PACKET + TX ring"]
+    end
+
+    subgraph hw["CAPA DE HARDWARE"]
+        direction LR
+        h1["x86_64<br/>SSE4.2"]
+        h2["ARM64 / NEON<br/>CRC32 / SVE"]
+        h3["AVX-512<br/>AVX2"]
+        h4["NIC / ESC<br/>PHC"]
+    end
+
+    app --> svc --> trans --> hw
 ```
 
-### 2.2 Ciclo de vida
+### 1.2 Arquitectura de Componentes Internos
 
-```c
-ChronosRT_status_t ChronosRT_init(ChronosRT_handle_t* handle,
-                                  const ChronosRT_config_t* config);
-ChronosRT_status_t ChronosRT_shutdown(ChronosRT_handle_t handle);
+#### Diagrama de Componentes
+
+```mermaid
+flowchart LR
+    root["ChronosRT Master Core"]
+
+    root --> em["EventManager"]
+    em --> em1["EventPool (pre-asignado)"]
+    em --> em2["BoundedQueue (Vyukov, MPMC)"]
+    em --> em3["RingBuffer (SPSC)"]
+
+    root --> mm["MemoryManager"]
+    mm --> mm1["MemoryPool (free-list lock-free)"]
+    mm --> mm2["HugePageAllocator (mmap/MADV_HUGEPAGE)"]
+    mm --> mm3["NUMAAwareAllocator (mbind)"]
+
+    root --> rtm["RTManager"]
+    rtm --> rtm1["Scheduler (SCHED_DEADLINE / SCHED_FIFO)"]
+    rtm --> rtm2["AffinityManager"]
+    rtm --> rtm3["TickTimer (timerfd)"]
+    rtm --> rtm4["LatencyHistogram / Watchdog"]
+
+    root --> pm["ProtocolManager"]
+    pm --> pm1["EtherCAT (ec_frame/socket/master/slave/dc/mailbox)"]
+    pm --> pm2["EtherTux (et_frame/fec/qos/sched/esm/sync/topology/mbx/flowagg/frm/socket/master)"]
+    pm --> pm3["Protocol selection (chronosrt_protocol)"]
+
+    root --> rm["ResilienceManager"]
+    rm --> rm1["Snapshot A/B (seqlock)"]
+    rm --> rm2["WAL (CRC + fsync por lotes)"]
+    rm --> rm3["GoldenImage (rename atómico)"]
+
+    root --> obs["Observability"]
+    obs --> obs1["Counters"]
+    obs --> obs2["Trace (trace_marker)"]
+    obs --> obs3["Lock-free selftest"]
+
+    root --> hwa["HWAccel"]
+    hwa --> hwa1["CRC-32C (SSE4.2 / ARMv8.1 / slice-by-8)"]
+    hwa --> hwa2["GF(2^8) y Reed-Solomon"]
+    hwa --> hwa3["PHC / Launch Time"]
 ```
 
-`ChronosRT_init` sondea el kernel (`ChronosRT_kernel_probe`), informa del nivel de
-soporte y **avisa** (sin fallar) si no hay PREEMPT_RT.
+### 1.3 Análisis de Complejidad Algorítmica
+
+| Operación | Complejidad Temporal | Complejidad Espacial | Operaciones Atómicas |
+|-----------|---------------------|---------------------|---------------------|
+| `event_publish()` | O(1) | O(1) | 1 push a cola bounded |
+| `event_subscribe()` | O(1) | O(1) | 1 pop de cola bounded |
+| `ring_push()` | O(1) | O(1) | 1 store + 1 fetch_add |
+| `ring_pop()` | O(1) | O(1) | 1 store + 1 fetch_sub |
+| `bounded_push()` | O(1) | O(1) | 1 CAS |
+| `bounded_pop()` | O(1) | O(1) | 1 CAS |
+| `mem_pool_alloc()` | O(1) | O(1) | 1 pop de free-list |
+| `mem_pool_free()` | O(1) | O(1) | 1 push a free-list |
+| `aalid_candidate()` | O(1) | O(1) | CRC-32C de 6 B plegado (sin ramas) |
+| `aalid_admit()` | O(1) amortizado | O(1) | Hash + cursor secuencial |
+| `aalid_lookup()` | O(1) medio | O(1) | Tabla hash abierta |
+| `aalid_release()` | O(slots) | O(1) | Recorrido de la tabla |
+
+La cola Michael-Scott (`chronosrt_mpmc.h`) se conserva como referencia; su
+`push`/`pop` asigna y libera nodos, por lo que **no** se usa en el camino
+caliente (riesgo de ABA y `malloc` por operación).
+
+### 1.4 Diagrama de Estados del Sistema
+
+```mermaid
+stateDiagram-v2
+    [*] --> INIT
+    INIT --> CONFIGURING: Load Config
+    CONFIGURING --> INITIALIZED: OK
+    CONFIGURING --> ERROR: Config Fail
+    INITIALIZED --> STARTING: Ready Start
+    STARTING --> RUNNING: Create Threads
+    RUNNING --> STOPPING: Cleanup
+    RUNNING --> PAUSED: Suspend
+    PAUSED --> RUNNING: Resume
+    STOPPING --> STOPPED: Terminated
+    ERROR --> [*]
+    STOPPED --> [*]
+```
+
+---
+
+## 2. Protocolos de Comunicación
+
+### 2.1 Protocolo de Eventos Internos
+
+ChronosRT Master utiliza un protocolo de eventos optimizado para mínima latencia:
 
 ```c
-ChronosRT_config_t cfg = {0};
-cfg.event_pool_size = 65536;
-cfg.lock_memory     = true;
-cfg.use_deadline    = true;
-cfg.use_timerfd     = true;
+// Estructura de evento interno (64 bytes - cache line)
+typedef struct ChronosRT_CACHE_ALIGNED {
+    volatile uint64_t sequence;        //  0-7:   Número de secuencia
+    volatile uint64_t timestamp_ns;    //  8-15:  Timestamp de creación
+    volatile uint32_t cpu_id;          // 16-19:  CPU que creó el evento
+    volatile uint8_t  data[56];        // 20-63:  Payload (56 bytes)
+} ChronosRT_event_t;
+```
 
-ChronosRT_handle_t rt;
-if (ChronosRT_init(&rt, &cfg) != ChronosRT_SUCCESS) {
-    return 1;
+La estructura **no** incluye prioridad ni tamaño explícito: el tamaño lo da la
+llamada `ChronosRT_event_publish(handle, data, size)` y se limita a 56 bytes.
+
+### 2.2 Protocolo de Red (maestro EtherCAT)
+
+ChronosRT Master soporta **dos protocolos de red seleccionables** (nunca simultáneos sobre la
+misma interfaz). El que se describe en este apartado es el **maestro EtherCAT** sobre Ethernet
+crudo (`AF_PACKET`, EtherType **0x88A4**), conforme a IEC 61158 / ETG.1000. El otro, **EtherTux**
+(EtherType **0x88B5**), se documenta en el apartado 13. La elección se resuelve en tiempo de
+configuración mediante `chronosrt_protocol.h` (`CHRONOSRT_PROTOCOL=ethercat|ethertux`).
+
+**Trama EtherCAT:**
+
+```c
+typedef struct {                       // 14 B
+    uint8_t  dst_mac[6];               // difusión FF:FF:FF:FF:FF:FF en el escaneo
+    uint8_t  src_mac[6];               // MAC de la interfaz del maestro
+    uint16_t ether_type;               // 0x88A4
+} ChronosRT_ec_eth_header_t;
+
+/* Cabecera EtherCAT (2 B): longitud (11 bits) | tipo (4 bits = 1) */
+typedef struct {                       // 2 B
+    uint16_t length_type;              // (len & 0x07FF) | (1u << 12)
+} ChronosRT_ec_header_t;
+```
+
+**Datagrama EtherCAT** (tras la cabecera, todos los campos little-endian):
+
+```c
+typedef struct {                       // 10 B + datos + 2 B
+    uint8_t  cmd;                      // comando (APRD, LRW, …)
+    uint8_t  idx;                      // índice (para casar respuesta)
+    uint16_t adp;                      // dirección de posición  } address =
+    uint16_t ado;                      // dirección de offset    } adp | (ado<<16)
+    uint16_t dlength;                  // 11 bits de longitud + bit M (0x8000)
+    uint16_t irq;                      // interrupción (0)
+    /* uint8_t data[dlength & 0x07FF]; */
+    /* uint16_t wkc;                    // contador de trabajo */
+} ChronosRT_ec_datagram_t;
+```
+
+El **bit M** (`0x8000` del campo `dlength`) indica que siguen más datagramas en la misma trama.
+El **contador de trabajo (WKC)** cuenta cuántas esclavas procesaron el datagrama; el maestro lo
+valida frente al valor esperado para detectar pérdidas.
+
+**Comandos soportados:** `NOP`, `APRD/APWR/APRW` (posición), `FPRD/FPWR/FPRW` (estación configurada),
+`BRD/BWR/BRW` (difusión), `LRD/LWR/LRW` (lógico), `ARMW/FRMW` (lectura+escritura con máscara).
+
+**API de serialización (pura y testeable sin hardware)** en `chronosrt_ethercat.h`:
+
+```c
+uint32_t ChronosRT_ec_datagram_build(uint8_t* buf, uint32_t buf_len, uint8_t cmd,
+                                     uint8_t idx, uint32_t address,
+                                     const void* data, uint16_t data_len, bool more);
+uint32_t ChronosRT_ec_datagram_parse(const uint8_t* buf, uint32_t buf_len,
+                                     ChronosRT_ec_datagram_t* out);
+uint16_t ChronosRT_ec_frame_header(uint8_t out[2], uint16_t datagram_bytes);
+```
+
+### 2.3 Diagrama de Secuencia - Comunicación Maestro-Esclavo
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant M as Master<br/>(ChronosRT)
+    participant N as Network<br/>Switch
+    participant S as Slave<br/>Device
+
+    M->>N: EtherCAT FPRD<br/>(Process Data Read)
+    N->>S: FPRD
+    M->>N: EtherCAT FPRW<br/>(Process Data Write)
+    N->>S: FPRW
+    S-->>N: Response
+    N-->>M: FPRW Response
+
+    M->>N: LRW<br/>(Logical Read Write)
+    N->>S: LRW
+    S-->>N: LRW Response
+    N-->>M: LRW Response
+
+    M->>N: Read/Write Mailbox
+    N->>S: Mailbox
+    S-->>N: Mailbox Response
+    N-->>M: Mailbox Response
+
+    M->>S: State Machine (ESM)
+    S-->>M: ESM ACK
+
+    Note over M,S: OPERATION CYCLE
+```
+
+### 2.4 Máquina de Estados EtherCAT (ESM)
+
+```mermaid
+stateDiagram-v2
+    [*] --> Init
+    Init --> PreOp: STARTUP
+    PreOp --> SafeOp: FREEZING
+    SafeOp --> Op: RUN
+    Op --> SafeOp: FREEZING
+    SafeOp --> PreOp: STOP
+    PreOp --> Init: INIT
+    Op --> Init: INIT
+    SafeOp --> Init: INIT
+
+    Init: INIT\nNo communication,\nlocal initialization only
+    PreOp: PRE-OP\nMailbox communication,\nno process data
+    SafeOp: SAFE-OP\nMailbox + process data\ninput, no output
+    Op: OP\nFull operation,\ninputs and outputs
+```
+
+---
+
+## 3. Gestión de Esclavos
+
+### 3.1 Estructura de Datos del Esclavo
+
+```c
+// Información del esclavo EtherCAT
+typedef struct ec_slave {
+    uint16_t vendor_id;            // Identificador del vendor
+    uint16_t product_code;         // Código del producto
+    uint32_t serial_number;        // Número de serie
+    uint16_t alias;                // Alias (configurable)
+    char     name[EC_MAXNAME];     // Nombre del dispositivo
+    uint8_t  current_state;        // Estado actual ESM
+    uint8_t  requested_state;      // Estado solicitado
+    uint16_t alias_address;        // Dirección de alias
+
+    // Información de Sync Managers
+    struct {
+        uint16_t start_address;    // Dirección inicial
+        uint16_t length;           // Longitud
+        uint8_t  control_register; // Registro de control
+        uint8_t  status_register;  // Registro de estado
+        bool     is_legal;         // Configuración válida
+    } sync_managers[EC_MAXSM];
+
+    // FMMU (Fieldbus Memory Management Unit)
+    struct {
+        uint32_t logical_address; // Dirección lógica
+        uint8_t  length;          // Longitud en bytes
+        uint8_t  start_bit;       // Bit inicial
+        uint8_t  type;            // Tipo (input/output)
+        bool     active;          // Activo
+    } fmmus[EC_MAXFMMU];
+
+    // PDO Mapping
+    struct {
+        uint16_t index;           // Índice de PDO
+        uint8_t  subindex;        // Subíndice
+        uint8_t  bit_length;      // Longitud en bits
+        uint32_t entry;           // Entry completo
+    } pdo_mapping[EC_MAXPDO];
+
+    uint16_t pdo_count;           // Número de PDOs mapeados
+    uint16_t eeprom_size;         // Tamaño de EEPROM
+
+    // Timestamps
+    uint64_t last_heartbeat_ns;   // Último heartbeat
+    uint32_t error_count;         // Contador de errores
+} ec_slave_t;
+```
+
+### 3.2 Procedimiento de Inicialización de Esclavo
+
+```c
+/**
+ * Inicialización completa de un esclavo EtherCAT
+ *
+ * @param slave Puntero al esclavo a inicializar
+ * @return código de error o 0 si éxito
+ */
+int ec_slave_init(ec_slave_t* slave) {
+    // 1. Leer información del esclavo desde EEPROM
+    int ret = ec_read_slave_identity(slave);
+    if (ret != 0) {
+        log_error("Failed to read slave identity: %d", ret);
+        return ret;
+    }
+
+    // 2. Configurar direccionamiento
+    ret = ec_configure_alias_address(slave, slave->alias);
+    if (ret != 0) {
+        log_error("Failed to configure alias: %d", ret);
+        return ret;
+    }
+
+    // 3. Inicializar Mailbox
+    ret = ec_init_mailbox(slave);
+    if (ret != 0) {
+        log_error("Mailbox init failed: %d", ret);
+        return ret;
+    }
+
+    // 4. Configurar SM (Sync Managers)
+    ret = ec_configure_sync_managers(slave);
+    if (ret != 0) {
+        log_error("SM configuration failed: %d", ret);
+        return ret;
+    }
+
+    // 5. Mapear PDOs
+    ret = ec_map_pdos(slave);
+    if (ret != 0) {
+        log_error("PDO mapping failed: %d", ret);
+        return ret;
+    }
+
+    // 6. Configurar FMMUs
+    ret = ec_configure_fmmus(slave);
+    if (ret != 0) {
+        log_error("FMMU configuration failed: %d", ret);
+        return ret;
+    }
+
+    // 7. Solicitar estado SAFE-OP
+    ret = ec_set_state(slave, EC_STATE_SAFE_OP);
+    if (ret != 0) {
+        log_error("Failed to set SAFE-OP: %d", ret);
+        return ret;
+    }
+
+    // 8. Verificar estado
+    ret = ec_verify_state(slave, EC_STATE_SAFE_OP, 1000); // 1s timeout
+    if (ret != 0) {
+        log_error("State verification failed: %d", ret);
+        return ret;
+    }
+
+    return 0;
 }
 ```
 
-### 2.3 Eventos
+### 3.3 Monitoreo de Esclavos
 
 ```c
+// Estructura para monitoreo de estado
+typedef struct {
+    uint16_t slave_index;
+    uint64_t last_update_ns;
+    uint32_t error_count;
+    uint8_t  state;
+    uint16_t wkc;                  // Working Counter
+    uint64_t latency_min_ns;
+    uint64_t latency_max_ns;
+    uint64_t latency_avg_ns;
+} slave_monitor_t;
+
+// Hilo de monitoreo de esclavos
+void* slave_monitor_thread(void* arg) {
+    ChronosRT_handle_t handle = (ChronosRT_handle_t)arg;
+
+    while (g_running) {
+        for (int i = 0; i < g_slave_count; i++) {
+            uint64_t start = ChronosRT_get_timestamp_ns();
+
+            // Enviar FRMW (Force Read Multiple Words)
+            int wkc = ec_send_frdw(g_slave_list[i].station_address);
+
+            uint64_t end = ChronosRT_get_timestamp_ns();
+            uint64_t latency = end - start;
+
+            // Actualizar métricas
+            update_slave_metrics(i, wkc, latency);
+        }
+
+        // Reportar estado cada segundo
+        report_slave_status();
+
+        usleep(1000);  // 1ms ciclo
+    }
+
+    return NULL;
+}
+
+// Actualización de métricas
+void update_slave_metrics(int slave_idx, int wkc, uint64_t latency) {
+    slave_monitor_t* mon = &g_slave_monitors[slave_idx];
+
+    mon->last_update_ns = ChronosRT_get_timestamp_ns();
+    mon->wkc = wkc;
+
+    if (wkc == 0) {
+        mon->error_count++;
+        log_warning("Slave %d: WKC=0 (communication error)", slave_idx);
+    }
+
+    // Actualizar latencia
+    if (latency < mon->latency_min_ns) mon->latency_min_ns = latency;
+    if (latency > mon->latency_max_ns) mon->latency_max_ns = latency;
+
+    // Calcular promedio móvil
+    mon->latency_avg_ns = (mon->latency_avg_ns * 7 + latency) / 8;
+}
+```
+
+### 3.4 Detección y Recuperación de Errores
+
+```c
+// Códigos de error de esclavo
+typedef enum {
+    EC_SLAVE_OK             = 0,
+    EC_SLAVE_ERROR_COMMS    = 1,    // Error de comunicación
+    EC_SLAVE_ERROR_TIMEOUT  = 2,    // Timeout de respuesta
+    EC_SLAVE_ERROR_STATE    = 3,    // Estado incorrecto
+    EC_SLAVE_ERROR_WKC      = 4,    // Working Counter inválido
+    EC_SLAVE_ERROR_SYNC     = 5,    // Error de sincronización
+    EC_SLAVE_ERROR_FMMU     = 6,    // Error FMMU
+    EC_SLAVE_ERROR_PDO      = 7,    // Error de PDO mapping
+    EC_SLAVE_ERROR_CONFIG   = 8     // Configuración inválida
+} ec_slave_error_t;
+
+// Procedimiento de recuperación
+int ec_recover_slave(ec_slave_t* slave) {
+    log_info("Attempting recovery of slave %s", slave->name);
+
+    // 1. Contador de intentos
+    static int recovery_attempts[EC_MAXSLAVE] = {0};
+
+    if (recovery_attempts[slave->index] > 3) {
+        log_error("Max recovery attempts reached for slave %d", slave->index);
+        recovery_attempts[slave->index] = 0;
+        return -1;
+    }
+
+    // 2. Intentar transition a INIT
+    int ret = ec_set_state(slave, EC_STATE_INIT);
+    if (ret != 0) {
+        log_error("Failed to set INIT state: %d", ret);
+        recovery_attempts[slave->index]++;
+        return ret;
+    }
+
+    usleep(100000);  // 100ms espera
+
+    // 3. Re-inicializar
+    ret = ec_slave_init(slave);
+    if (ret != 0) {
+        log_error("Re-initialization failed: %d", ret);
+        recovery_attempts[slave->index]++;
+        return ret;
+    }
+
+    // 4. Volver a Safe-Op
+    ret = ec_set_state(slave, EC_STATE_SAFE_OP);
+    if (ret != 0) {
+        log_error("Failed to return to SAFE-OP: %d", ret);
+        recovery_attempts[slave->index]++;
+        return ret;
+    }
+
+    recovery_attempts[slave->index] = 0;
+    log_info("Slave %s recovered successfully", slave->name);
+
+    return 0;
+}
+```
+
+---
+
+## 4. Configuración Avanzada de Comunicación
+
+### 4.1 Parámetros de Comunicación
+
+```c
+// Estructura de configuración avanzada de red
+typedef struct {
+    // Timeouts (en microsegundos)
+    uint32_t timeout_init;         // Timeout inicialización
+    uint32_t timeout_cycle;        // Timeout de ciclo
+    uint32_t timeout_mailbox;      // Timeout mailbox
+    uint32_t timeout_peer;         // Timeout de peer
+
+    // Sizes
+    uint16_t max_slaves;           // Máximo de esclavos
+    uint16_t max_mbx_size;         // Tamaño máximo de mailbox
+    uint16_t max_pdo_size;         // Tamaño máximo de PDO
+
+    // Performance
+    uint8_t  cycle_interval_ns;    // Intervalo de ciclo en ns
+    uint8_t  retries;              // Número de reintentos
+    bool     use_watchdog;         // Habilitar watchdog
+    uint16_t watchdog_interval_ms; // Intervalo de watchdog
+
+    // Advanced
+    bool     use_dc;               // Distributed Clock
+    uint32_t dc_cycle_ns;          // Ciclo DC en ns
+    uint32_t dc_sync0_offset_ns;   // Offset SYNC0
+    uint32_t dc_sync1_offset_ns;   // Offset SYNC1
+} ec_com_config_t;
+```
+
+### 4.2 Configuración de Distributed Clocks
+
+```c
+// Configuración de Distributed Clocks (DC)
+int ec_configure_dc(ec_slave_t* slave, uint32_t cycle_ns) {
+    // 1. Leer capacidad DC del esclavo
+    uint32_t capabilities = ec_read_dc_capabilities(slave);
+    if (!(capabilities & EC_DC_SUPPORTED)) {
+        log_warning("Slave %s does not support DC", slave->name);
+        return -1;
+    }
+
+    // 2. Configurar tiempo de ciclo
+    int ret = ec_write_dc_cycle_time(slave, cycle_ns);
+    if (ret != 0) return ret;
+
+    // 3. Configurar offsets
+    ret = ec_write_dc_sync0_time(slave, 0);  // SYNC0 al inicio del ciclo
+    if (ret != 0) return ret;
+
+    ret = ec_write_dc_sync1_time(slave, cycle_ns / 2);  // SYNC1 a mitad
+    if (ret != 0) return ret;
+
+    // 4. Habilitar DC
+    ret = ec_write_dc_control(slave, EC_DC_ENABLE);
+    if (ret != 0) return ret;
+
+    // 5. Sincronizar con maestro
+    ret = ec_dc_sync(slave, 1000000);  // 1ms timeout
+    if (ret != 0) return ret;
+
+    log_info("DC configured for %s: cycle=%dns", slave->name, cycle_ns);
+    return 0;
+}
+
+// Algoritmo de sincronización DC
+int ec_dc_sync(ec_slave_t* slave, uint32_t timeout_us) {
+    uint64_t start_ns = ChronosRT_get_timestamp_ns();
+    uint64_t target_time;
+    int64_t offset;
+
+    // 1. Obtener tiempo actual del maestro
+    uint64_t master_time = get_master_time_ns();
+
+    // 2. Leer tiempo del esclavo
+    uint64_t slave_time = ec_read_dc_time(slave);
+
+    // 3. Calcular offset
+    offset = (int64_t)slave_time - (int64_t)master_time;
+
+    // 4. Aplicar corrección
+    if (offset > EC_DC_MAX_OFFSET) {
+        // Ajuste grande - puede causar glitch
+        ec_write_dc_time(slave, master_time);
+        log_warning("Large DC offset correction: %lld ns", offset);
+    } else if (offset > EC_DC_SMALL_OFFSET) {
+        // Ajuste gradual
+        uint32_t correction = (uint32_t)(offset / 2);
+        ec_write_dc_time_offset(slave, correction);
+    }
+
+    // 5. Esperar y verificar
+    usleep(100);  // 100us para que tome efecto
+
+    uint64_t verify_time = ec_read_dc_time(slave);
+    uint64_t new_offset = (verify_time > master_time) ?
+        verify_time - master_time : master_time - verify_time;
+
+    if (new_offset > EC_DC_MAX_OFFSET) {
+        log_error("DC sync failed: offset=%llu", new_offset);
+        return -1;
+    }
+
+    log_debug("DC sync complete: offset=%lld ns", (int64_t)new_offset);
+    return 0;
+}
+```
+
+### 4.3 Configuración de PDOs
+
+```c
+// Mapeo de PDO dinámico
+int ec_configure_pdo_mapping(ec_slave_t* slave,
+                              uint16_t pdo_index,
+                              ec_pdo_entry_t* entries,
+                              int entry_count) {
+
+    // 1. Buscar PDO por índice
+    ec_pdo_t* pdo = ec_find_pdo(slave, pdo_index);
+    if (!pdo) {
+        log_error("PDO 0x%04X not found", pdo_index);
+        return -1;
+    }
+
+    // 2. Validar entradas
+    uint16_t total_bits = 0;
+    for (int i = 0; i < entry_count; i++) {
+        if (entries[i].bit_length == 0 || entries[i].bit_length > 64) {
+            log_error("Invalid bit length for entry %d", i);
+            return -1;
+        }
+        total_bits += entries[i].bit_length;
+    }
+
+    if (total_bits > 64) {
+        log_error("PDO mapping exceeds 64 bits: %d", total_bits);
+        return -1;
+    }
+
+    // 3. Configurar entradas
+    for (int i = 0; i < entry_count; i++) {
+        int ret = ec_pdo_add_entry(pdo,
+                                    entries[i].index,
+                                    entries[i].subindex,
+                                    entries[i].bit_length);
+        if (ret != 0) {
+            log_error("Failed to add PDO entry 0x%04X/%d",
+                     entries[i].index, entries[i].subindex);
+            return ret;
+        }
+    }
+
+    // 4. Activar PDO
+    return ec_pdo_activate(pdo);
+}
+
+// Estructura de entrada PDO
+typedef struct {
+    uint16_t index;       // Índice de objeto
+    uint8_t  subindex;    // Subíndice
+    uint8_t  bit_length;   // Longitud en bits
+    void*    data_ptr;     // Puntero a datos
+} ec_pdo_entry_t;
+```
+
+---
+
+## 5. API de Desarrollo
+
+### 5.1 API Completa de Eventos
+
+```c
+/**
+ * Inicialización del sistema ChronosRT Master
+ *
+ * @param handle Puntero al handle de salida
+ * @param config Configuración del sistema
+ * @return ChronosRT_SUCCESS o código de error
+ */
+ChronosRT_status_t ChronosRT_init(ChronosRT_handle_t* handle,
+                                   const ChronosRT_config_t* config);
+
+/**
+ * Cierre del sistema
+ *
+ * @param handle Handle de ChronosRT Master
+ * @return ChronosRT_SUCCESS o código de error
+ */
+ChronosRT_status_t ChronosRT_shutdown(ChronosRT_handle_t handle);
+
+/**
+ * Publicar un evento
+ *
+ * @param handle Handle de ChronosRT Master
+ * @param data Puntero a datos del evento
+ * @param size Tamaño de datos (máx 56 bytes)
+ * @return ChronosRT_SUCCESS o código de error
+ */
 ChronosRT_status_t ChronosRT_event_publish(ChronosRT_handle_t handle,
-                                           const void* data, uint32_t size);
+                                            const void* data,
+                                            uint32_t size);
+
+/**
+ * Suscribirse a un evento
+ *
+ * @param handle Handle de ChronosRT Master
+ * @param event Evento de salida
+ * @param timeout_us Timeout en microsegundos
+ * @return ChronosRT_SUCCESS, TIMEOUT, o código de error
+ */
 ChronosRT_status_t ChronosRT_event_subscribe(ChronosRT_handle_t handle,
-                                             ChronosRT_event_t* event,
-                                             uint32_t timeout_us);
-```
+                                              ChronosRT_event_t* event,
+                                              uint32_t timeout_us);
 
-- `data` se copia en el evento; como máximo caben **56 bytes**.
-- `event_publish` **no asigna memoria**: usa el pool pre-asignado y una cola
-  lock-free (cero `malloc` en el camino caliente).
-
-```c
-typedef struct ChronosRT_CACHE_ALIGNED {
-    volatile uint64_t sequence;
-    volatile uint64_t timestamp_ns;
-    volatile uint32_t cpu_id;
-    volatile uint8_t  data[56];
-} ChronosRT_event_t;   /* 64 B, alineado a línea de caché */
-```
-
-### 2.4 Benchmark y métricas
-
-```c
+/**
+ * Ejecutar un benchmark bajo demanda
+ *
+ * @param handle Handle de ChronosRT Master
+ * @param mode Modo (LATENCY, THROUGHPUT, JITTER, STRESS, WCET)
+ * @param duration_sec Duración en segundos
+ * @param metrics Estructura de métricas de salida
+ * @return ChronosRT_SUCCESS o código de error
+ */
 ChronosRT_status_t ChronosRT_benchmark_run(ChronosRT_handle_t handle,
                                            ChronosRT_benchmark_mode_t mode,
                                            uint32_t duration_sec,
                                            ChronosRT_metrics_t* metrics);
 
-/* Variante con control del número de hilos (throughput/estrés). */
-ChronosRT_status_t ChronosRT_benchmark_run_ex(ChronosRT_handle_t handle,
-                                              ChronosRT_benchmark_mode_t mode,
-                                              uint32_t duration_sec,
-                                              uint32_t threads,
-                                              ChronosRT_metrics_t* metrics);
-
+/** Imprime un reporte formateado de las métricas. */
 ChronosRT_status_t ChronosRT_metrics_report(const ChronosRT_metrics_t* metrics);
+
+/** Contador de ciclos y timestamp monotónico. */
+uint64_t ChronosRT_get_cycles(void);
+uint64_t ChronosRT_get_timestamp_ns(void);
 ```
 
-Modos: `ChronosRT_MODE_LATENCY`, `_THROUGHPUT`, `_JITTER`, `_STRESS`, `_WCET`.
-En `_THROUGHPUT` los hilos se reparten en productores y consumidores; con
-`threads = 16` se usan 8 productores y 8 consumidores.
-
-Antes de medir, cada hilo se eleva a `SCHED_FIFO` prioridad 80, se fija a una CPU
-distinta del conjunto permitido y ejecuta 20 000 iteraciones de calentamiento.
-Si hay más hilos que CPUs disponibles, la elevación se omite para evitar que un
-productor que nunca se bloquea hambriente al consumidor.
+### 5.2 Ejemplo de Uso de la API
 
 ```c
-typedef struct ChronosRT_CACHE_ALIGNED {
-    uint64_t total_events;
-    uint64_t total_cycles;
-    uint64_t min_latency_ns;
-    uint64_t max_latency_ns;
-    uint64_t avg_latency_ns;
-    uint64_t stddev_ns;
-    double   cpu_usage_percent;
-    double   cache_miss_rate;
-    double   branch_miss_rate;
-    uint64_t memory_bandwidth_mbps;
-    uint64_t wcet_ns;
-    uint64_t best_case_ns;
-    /* Percentiles de la ventana medida (0 si el modo no los calcula). */
-    uint64_t p50_ns;
-    uint64_t p99_ns;
-    uint64_t p999_ns;
-    /* Muestras que superan CHRONOSRT_LATENCY_TARGET_NS (10 µs). */
-    uint64_t latency_spikes;
-} ChronosRT_metrics_t;
+#include <chronosrt/chronosrt.h>
+#include <stdio.h>
+#include <signal.h>
+
+static volatile bool g_running = true;
+
+void signal_handler(int sig) {
+    (void)sig;
+    g_running = false;
+}
+
+int main(int argc, char* argv[]) {
+    (void)argc; (void)argv;
+
+    // Configurar handler de señales
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    // Configuración del sistema
+    ChronosRT_config_t config = {
+        .event_pool_size = 65536,
+        .batch_size = 256,
+        .use_simd = true,
+        .use_cpu_affinity = true,
+        .use_hugepages = false,
+        .platform = ChronosRT_PLATFORM_RPI4
+    };
+
+    // Inicializar ChronosRT Master
+    ChronosRT_handle_t handle;
+    ChronosRT_status_t status = ChronosRT_init(&handle, &config);
+    if (status != ChronosRT_SUCCESS) {
+        fprintf(stderr, "Failed to initialize: %d\n", status);
+        return 1;
+    }
+
+    printf("ChronosRT Master initialized successfully\n");
+
+    // Datos de ejemplo
+    typedef struct {
+        float position;
+        float velocity;
+        uint32_t timestamp;
+    } control_data_t;
+
+    control_data_t data = {0};
+    uint64_t iteration = 0;
+
+    // Loop principal
+    while (g_running) {
+        // Leer datos de sensores (simulado)
+        data.position = (float)(iteration % 1000) / 10.0f;
+        data.velocity = (float)((iteration % 100) / 10.0f);
+        data.timestamp = (uint32_t)ChronosRT_get_timestamp_ns();
+
+        // Publicar evento
+        status = ChronosRT_event_publish(handle, &data, sizeof(data));
+        if (status != ChronosRT_SUCCESS) {
+            fprintf(stderr, "Publish failed: %d\n", status);
+        }
+
+        iteration++;
+
+        // Simular control a 1 kHz.
+        // En producción use ChronosRT_tick_wait() (timerfd) y SCHED_DEADLINE.
+        usleep(1000);  // 1 ms = 1000 us
+    }
+
+    // Benchmark de WCET bajo demanda (no hay "get_metrics" en runtime)
+    ChronosRT_metrics_t metrics;
+    if (ChronosRT_benchmark_run(handle, ChronosRT_MODE_WCET, 1u, &metrics) ==
+        ChronosRT_SUCCESS) {
+        ChronosRT_metrics_report(&metrics);
+    }
+
+    // Apagar
+    ChronosRT_shutdown(handle);
+    printf("ChronosRT shut down\n");
+
+    return 0;
+}
 ```
 
-### 2.5 Utilidades y metadatos ABI
+### 5.3 API de planificación, memoria y tiempo real
 
 ```c
-uint64_t ChronosRT_get_cycles(void);          /* contador de ciclos robusto */
-uint64_t ChronosRT_get_timestamp_ns(void);    /* CLOCK_MONOTONIC en ns      */
-ChronosRT_platform_t ChronosRT_detect_platform(void);
-
-const char* ChronosRT_abi_version_string(void);  /* "0.1.0"        */
-uint32_t    ChronosRT_abi_version(void);         /* 0x000100       */
-```
-
-En x86-64 `get_cycles` usa `rdtscp` serializado; en ARM64 usa
-`perf_event_open(PERF_COUNT_HW_CPU_CYCLES)` con *fallback* a `CLOCK_MONOTONIC`.
-
-Plataformas: `RPI4`, `RPI5`, `JETSON_NANO`, `JETSON_ORIN`, `INTEL_NUC`,
-`ORANGE_PI5`, `ROCK5B`, `X86_64_RT`, `GENERIC`.
-
----
-
-## 3. Kernel y planificación de tiempo real
-
-### 3.1 Sondeo del kernel — `chronosrt_kernel.h`
-
-```c
-typedef struct {
-    uint32_t major, minor, patch;
-    char     release[128];
-    bool     preempt_rt;
-    bool     isolcpus, nohz_full, rcu_nocbs;
-    bool     eevdf;              /* >= 6.6  */
-    bool     sched_ext;          /* >= 6.12 */
-    bool     io_uring;
-    bool     af_xdp;
-    bool     sched_deadline;
-    bool     sched_ext_enabled;  /* disponible realmente en runtime */
-    bool     memfd_secret;
-    uint32_t support_level;      /* 0..3; 3 = kernel 7.x pleno */
-} ChronosRT_kernel_info_t;
-
-ChronosRT_status_t ChronosRT_kernel_probe(ChronosRT_kernel_info_t* info);
-void               ChronosRT_kernel_print(const ChronosRT_kernel_info_t* info);
-int                ChronosRT_kernel_summary(const ChronosRT_kernel_info_t* info,
-                                            char* buf, size_t len);
-bool               ChronosRT_kernel_is_supported(const ChronosRT_kernel_info_t* info);
-```
-
-Soporte mínimo declarado: Linux **5.15**; soporte pleno: **7.x**. Niveles:
-`0` no soportado, `1` básico, `2` tiempo real, `3` kernel 7.x pleno.
-
-### 3.2 Planificación y aislamiento — `chronosrt_sched.h`
-
-```c
-typedef struct {
-    uint64_t runtime_ns;
-    uint64_t deadline_ns;
-    uint64_t period_ns;
-    int      cpu;          /* -1 = sin afinidad */
-} ChronosRT_deadline_attr_t;
-
+/* chronosrt_sched.h — SCHED_DEADLINE / SCHED_FIFO / afinidad / aislamiento */
 bool               ChronosRT_sched_deadline_supported(void);
 ChronosRT_status_t ChronosRT_sched_set_deadline_current(const ChronosRT_deadline_attr_t* attr);
 ChronosRT_status_t ChronosRT_sched_set_fifo_current(int priority);
 ChronosRT_status_t ChronosRT_sched_set_affinity_current(int cpu);
-
-typedef struct {
-    bool     isolcpus, nohz_full, rcu_nocbs;
-    uint32_t num_isolated;
-    int      isolated[ChronosRT_MAX_CPUS];
-    bool     strict_ok;
-} ChronosRT_isolation_t;
-
 ChronosRT_status_t ChronosRT_sched_isolation_probe(ChronosRT_isolation_t* out);
 bool               ChronosRT_sched_cpu_is_isolated(const ChronosRT_isolation_t* iso, int cpu);
 void               ChronosRT_sched_isolation_print(const ChronosRT_isolation_t* iso);
 int                ChronosRT_sched_online_cpus(void);
-```
 
-`SCHED_DEADLINE` aplica admisión en el kernel; si el kernel lo rechaza se devuelve
-`ChronosRT_ERROR_NOTSUP` y la aplicación puede caer a `SCHED_FIFO`.
+/* chronosrt_mem.h — bloqueo de memoria, hugepages y NUMA */
+ChronosRT_status_t ChronosRT_mem_lock_all(void);
+void               ChronosRT_mem_unlock_all(void);
+size_t             ChronosRT_mem_hugepage_size(void);
+int                ChronosRT_mem_current_numa_node(void);
+int                ChronosRT_mem_numa_nodes(void);
 
----
-
-## 4. Instrumentación de tiempo real — `chronosrt_rt.h`
-
-### 4.1 Histograma de latencias (RT-6)
-
-```c
-#define CHRONOSRT_HIST_BUCKETS 64
-
-typedef struct {
-    uint64_t bucket_ns;
-    uint64_t buckets[CHRONOSRT_HIST_BUCKETS];
-    uint64_t count, sum_ns, sum_sq_ns, min_ns, max_ns, overflow;
-} ChronosRT_hist_t;
-
-void     ChronosRT_hist_init(ChronosRT_hist_t* h, uint64_t bucket_ns);
-void     ChronosRT_hist_reset(ChronosRT_hist_t* h);
-void     ChronosRT_hist_record(ChronosRT_hist_t* h, uint64_t latency_ns);
-uint64_t ChronosRT_hist_count(const ChronosRT_hist_t* h);
-uint64_t ChronosRT_hist_mean_ns(const ChronosRT_hist_t* h);
-uint64_t ChronosRT_hist_stddev_ns(const ChronosRT_hist_t* h);
-uint64_t ChronosRT_hist_percentile_ns(const ChronosRT_hist_t* h, double p);
-uint64_t ChronosRT_hist_wcet_ns(const ChronosRT_hist_t* h);
-uint64_t ChronosRT_hist_best_ns(const ChronosRT_hist_t* h);
-void     ChronosRT_hist_print(const ChronosRT_hist_t* h, const char* label);
-```
-
-### 4.2 Watchdog y tick (RS-4, RT-8)
-
-```c
-typedef struct {
-    _Atomic uint64_t last_kick_ns;
-    uint64_t         timeout_ns;
-} ChronosRT_watchdog_t;
+/* chronosrt_rt.h — tick periódico, watchdog e histograma */
+ChronosRT_status_t ChronosRT_tick_init(ChronosRT_tick_t* tick, uint64_t period_ns);
+int                ChronosRT_tick_wait(ChronosRT_tick_t* tick);
+void               ChronosRT_tick_destroy(ChronosRT_tick_t* tick);
 
 ChronosRT_status_t ChronosRT_watchdog_init(ChronosRT_watchdog_t* wd, uint64_t timeout_ns);
 void               ChronosRT_watchdog_kick(ChronosRT_watchdog_t* wd);
 bool               ChronosRT_watchdog_expired(const ChronosRT_watchdog_t* wd);
-uint64_t           ChronosRT_watchdog_elapsed_ns(const ChronosRT_watchdog_t* wd);
-void               ChronosRT_watchdog_destroy(ChronosRT_watchdog_t* wd);
 bool               ChronosRT_watchdog_hw_available(void);
 
-typedef struct { int fd; uint64_t period_ns; } ChronosRT_tick_t;
+void               ChronosRT_hist_init(ChronosRT_hist_t* h, uint64_t bucket_ns);
+void               ChronosRT_hist_record(ChronosRT_hist_t* h, uint64_t latency_ns);
+uint64_t           ChronosRT_hist_percentile_ns(const ChronosRT_hist_t* h, double p);
+uint64_t           ChronosRT_hist_wcet_ns(const ChronosRT_hist_t* h);
 
-ChronosRT_status_t ChronosRT_tick_init(ChronosRT_tick_t* tick, uint64_t period_ns);
-int                ChronosRT_tick_fd(const ChronosRT_tick_t* tick);
-int                ChronosRT_tick_wait(ChronosRT_tick_t* tick);
-void               ChronosRT_tick_destroy(ChronosRT_tick_t* tick);
+/* chronosrt_kernel.h — sondeo del kernel */
+ChronosRT_status_t ChronosRT_kernel_probe(ChronosRT_kernel_info_t* info);
+void               ChronosRT_kernel_print(const ChronosRT_kernel_info_t* info);
+bool               ChronosRT_kernel_is_supported(const ChronosRT_kernel_info_t* info);
 ```
 
-`ChronosRT_watchdog_hw_available()` solo comprueba la existencia de
-`/dev/watchdog`; no lo abre (no arma el temporizador).
-
----
-
-## 5. Memoria — `chronosrt_mem.h`
+### 5.4 API de resiliencia y observabilidad
 
 ```c
-ChronosRT_status_t ChronosRT_mem_pool_init(ChronosRT_mem_pool_t* pool,
-                                           uint32_t pool_size, uint32_t block_size);
-ChronosRT_mem_pool_t* ChronosRT_mem_pool_create(uint32_t pool_size, uint32_t block_size);
-ChronosRT_mem_pool_t* ChronosRT_mem_pool_create_ex(uint32_t pool_size, uint32_t block_size,
-                                                   bool hugepage, bool numa_local);
-ChronosRT_status_t ChronosRT_mem_pool_init_ex(ChronosRT_mem_pool_t* pool,
-                                              uint32_t pool_size, uint32_t block_size,
-                                              bool hugepage, bool numa_local);
-void               ChronosRT_mem_pool_delete(ChronosRT_mem_pool_t* pool);
-
-void*              ChronosRT_mem_pool_alloc(ChronosRT_mem_pool_t* pool);
-void               ChronosRT_mem_pool_free(ChronosRT_mem_pool_t* pool, void* block);
-void               ChronosRT_mem_pool_destroy(ChronosRT_mem_pool_t* pool);
-uint32_t           ChronosRT_mem_pool_available(ChronosRT_mem_pool_t* pool);
-uint32_t           ChronosRT_mem_pool_capacity(ChronosRT_mem_pool_t* pool);
-ChronosRT_status_t ChronosRT_mem_pool_prefault(ChronosRT_mem_pool_t* pool);
-
-ChronosRT_status_t ChronosRT_mem_lock_all(void);
-void               ChronosRT_mem_unlock_all(void);
-size_t             ChronosRT_mem_hugepage_size(void);
-
-int                ChronosRT_mem_current_numa_node(void);
-int                ChronosRT_mem_numa_nodes(void);
-```
-
-El pool usa una *free-list* sobre una cola *bounded* lock-free: `alloc/free` son
-O(1), sin ABA y sin asignación en el camino caliente.
-
----
-
-## 6. Estructuras lock-free
-
-### 6.1 Ring SPSC — `chronosrt_ring.h` (header-only)
-
-```c
-#define RING_CAPACITY 4096
-
-typedef struct ChronosRT_ring {
-    _Alignas(CHRONOSRT_CACHELINE) void* buffer[RING_CAPACITY];
-    _Alignas(CHRONOSRT_CACHELINE) _Atomic uint32_t head;
-    _Atomic uint32_t tail;
-    _Atomic uint32_t count;
-} ChronosRT_ring_t;
-
-void       ChronosRT_ring_init(ChronosRT_ring_t* ring);
-bool       ChronosRT_ring_push(ChronosRT_ring_t* ring, void* item);
-void*      ChronosRT_ring_pop(ChronosRT_ring_t* ring);
-uint32_t   ChronosRT_ring_count(ChronosRT_ring_t* ring);
-bool       ChronosRT_ring_is_empty(ChronosRT_ring_t* ring);
-bool       ChronosRT_ring_is_full(ChronosRT_ring_t* ring);
-```
-
-### 6.2 MPMC Michael-Scott — `chronosrt_mpmc.h` (header-only, referencia)
-
-```c
-void  ChronosRT_mpmc_init(ChronosRT_mpmc_queue_t* queue);
-void  ChronosRT_mpmc_destroy(ChronosRT_mpmc_queue_t* queue);
-bool  ChronosRT_mpmc_push(ChronosRT_mpmc_queue_t* queue, void* data);
-void* ChronosRT_mpmc_pop(ChronosRT_mpmc_queue_t* queue);
-uint64_t ChronosRT_mpmc_count(ChronosRT_mpmc_queue_t* queue);
-```
-
-Es la implementación de referencia; el camino caliente usa la variante *bounded*
-(PF-3) porque la MPMC con `free` de nodos tiene riesgo de ABA y asigna por
-operación.
-
-### 6.3 Cola MPMC acotada (Vyukov) — `chronosrt_bounded.h` (header-only)
-
-```c
-typedef struct {
-    _Atomic uint64_t sequence;
-    void* data;
-} ChronosRT_bounded_cell_t;
-
-typedef struct ChronosRT_bounded_queue {
-    _Alignas(CHRONOSRT_CACHELINE) _Atomic uint64_t enqueue_pos;
-    _Alignas(CHRONOSRT_CACHELINE) _Atomic uint64_t dequeue_pos;
-    _Alignas(CHRONOSRT_CACHELINE) ChronosRT_bounded_cell_t* cells;
-    uint64_t capacity, mask;
-    void* raw;
-} ChronosRT_bounded_queue_t;
-
-ChronosRT_status_t ChronosRT_bounded_init(ChronosRT_bounded_queue_t* q, uint64_t capacity);
-void               ChronosRT_bounded_destroy(ChronosRT_bounded_queue_t* q);
-bool               ChronosRT_bounded_push(ChronosRT_bounded_queue_t* q, void* data);
-bool               ChronosRT_bounded_pop(ChronosRT_bounded_queue_t* q, void** out);
-uint64_t           ChronosRT_bounded_count(const ChronosRT_bounded_queue_t* q);
-bool               ChronosRT_bounded_empty(const ChronosRT_bounded_queue_t* q);
-uint64_t           ChronosRT_bounded_capacity(const ChronosRT_bounded_queue_t* q);
-```
-
-Sin asignación por operación, sin ABA y con `acquire/release` explícitos.
-
----
-
-## 7. Resiliencia — `chronosrt_resilience.h`
-
-### 7.1 Snapshot A/B con seqlock (RS-1)
-
-```c
-typedef struct {
-    uint32_t size;
-    _Atomic uint32_t seq;
-    _Atomic uint32_t active;
-    uint8_t* buf[2];
-} ChronosRT_snapshot_t;
-
+/* chronosrt_resilience.h */
 ChronosRT_status_t ChronosRT_snapshot_init(ChronosRT_snapshot_t* s, uint32_t size);
 ChronosRT_status_t ChronosRT_snapshot_write(ChronosRT_snapshot_t* s, const void* data, uint32_t size);
 ChronosRT_status_t ChronosRT_snapshot_read(const ChronosRT_snapshot_t* s, void* out, uint32_t size);
-uint32_t           ChronosRT_snapshot_sequence(const ChronosRT_snapshot_t* s);
-void               ChronosRT_snapshot_destroy(ChronosRT_snapshot_t* s);
-```
-
-### 7.2 WAL con CRC y `fsync` por lotes (RS-3)
-
-```c
-#define CHRONOSRT_WAL_PATH_MAX 256
-#define CHRONOSRT_WAL_REC_MAX  (1u << 20)
-
-typedef struct {
-    int      fd;
-    char     path[CHRONOSRT_WAL_PATH_MAX];
-    uint32_t batch;
-    uint32_t pending;
-    uint64_t seq;
-} ChronosRT_wal_t;
 
 ChronosRT_status_t ChronosRT_wal_open(ChronosRT_wal_t* w, const char* path, uint32_t batch);
 ChronosRT_status_t ChronosRT_wal_append(ChronosRT_wal_t* w, const void* rec, uint32_t len);
 ChronosRT_status_t ChronosRT_wal_sync(ChronosRT_wal_t* w);
-uint64_t           ChronosRT_wal_seq(const ChronosRT_wal_t* w);
-void               ChronosRT_wal_close(ChronosRT_wal_t* w);
+int                ChronosRT_wal_replay(const char* path,
+                                        int (*cb)(const void* rec, uint32_t len, void* ud),
+                                        void* ud);
 
-int ChronosRT_wal_replay(const char* path,
-                         int (*cb)(const void* rec, uint32_t len, void* ud),
-                         void* ud);
-```
-
-`wal_replay` verifica el CRC de cada entrada y se detiene en la primera corrupta
-(escritura truncada).
-
-### 7.3 Golden image (RS-6)
-
-```c
 ChronosRT_status_t ChronosRT_golden_save(const char* path, const void* data, uint32_t len);
 ChronosRT_status_t ChronosRT_golden_load(const char* path, void* out, uint32_t cap, uint32_t* out_len);
-uint32_t           ChronosRT_golden_crc(const void* data, uint32_t len);
-```
 
-Escritura atómica: `<path>.tmp` → `fsync` → `rename`.
-
----
-
-## 8. Observabilidad — `chronosrt_obs.h`
-
-```c
-typedef struct {
-    _Atomic uint64_t published, consumed, dropped, errors, forwarded;
-} ChronosRT_counters_t;
-
-void ChronosRT_counters_init(ChronosRT_counters_t* c);
-void ChronosRT_counters_add(ChronosRT_counters_t* c, _Atomic uint64_t* field, uint64_t delta);
-void ChronosRT_counters_reset(ChronosRT_counters_t* c);
-void ChronosRT_counters_print(const ChronosRT_counters_t* c, const char* label);
-
-typedef struct { int fd; bool active; } ChronosRT_trace_t;
-
+/* chronosrt_obs.h */
+void               ChronosRT_counters_init(ChronosRT_counters_t* c);
+void               ChronosRT_counters_print(const ChronosRT_counters_t* c, const char* label);
 ChronosRT_status_t ChronosRT_trace_init(ChronosRT_trace_t* t);
 int                ChronosRT_trace_mark(ChronosRT_trace_t* t, const char* msg);
-void               ChronosRT_trace_destroy(ChronosRT_trace_t* t);
-
-typedef struct {
-    uint64_t produced, consumed, duplicates, lost;
-} ChronosRT_lockfree_stats_t;
-
 ChronosRT_status_t ChronosRT_selftest_bounded_queue(uint32_t producers, uint32_t consumers,
                                                     uint64_t total,
                                                     ChronosRT_lockfree_stats_t* out);
-ChronosRT_status_t ChronosRT_selftest_ring(uint64_t total, ChronosRT_lockfree_stats_t* out);
 ```
 
-`trace` usa `trace_marker` de ftrace si hay permisos; si no, es un *no-op* seguro.
-Los autotests validan ausencia de pérdidas y duplicados en las colas.
+> **No existe** una API de reconfiguración en caliente (`ChronosRT_reconfigure`) ni
+> de logging/callbacks globales. La configuración se fija en `ChronosRT_init`;
+> para cambiar parámetros de red en caliente use `ChronosRT_et_master_set_qos`,
+> `set_fec` y `set_tx_mode`.
 
 ---
 
-## 9. SIMD — `chronosrt_simd.h`
+## 6. Debugging y Logging
+
+### 6.1 Observabilidad y logging
+
+ChronosRT **no impone un sistema de logging global**. Para diagnóstico ofrece
+tres mecanismos de bajo coste:
 
 ```c
-void     ChronosRT_simd_batch_zero(void* ptr, size_t count);
-void     ChronosRT_simd_batch_copy(void* dst, const void* src, size_t count);
-uint32_t ChronosRT_simd_hash(const void* data, size_t size);
+#include <chronosrt/chronosrt_obs.h>
+
+/* 1. Contadores atómicos consultables en vivo. */
+ChronosRT_counters_t counters;
+ChronosRT_counters_init(&counters);
+ChronosRT_counters_print(&counters, "rx");
+/* published, consumed, dropped, errors, forwarded */
+
+/* 2. Traza de baja sobrecarga (trace_marker de ftrace, best-effort). */
+ChronosRT_trace_t trace;
+if (ChronosRT_trace_init(&trace) == ChronosRT_SUCCESS) {
+    ChronosRT_trace_mark(&trace, "cycle-start");
+    /* ... */
+    ChronosRT_trace_destroy(&trace);
+}
+
+/* 3. Autotest de colas lock-free (pérdidas/duplicados). */
+ChronosRT_lockfree_stats_t lf;
+ChronosRT_selftest_bounded_queue(2u, 2u, 100000u, &lf);
 ```
 
-Despacho por arquitectura (AVX-512/AVX2/NEON) con *fallback* portable.
+Para mensajes de aplicación use `fprintf(stderr, ...)` o su propio logger; el
+kernel ya aporta timestamps y la traza de ftrace. El detector de kernel imprime
+su estado con `ChronosRT_kernel_print()` al inicializar.
+
+### 6.2 Debugging con GDB
+
+```bash
+# Compilar con symbols de debug
+cmake .. -DCMAKE_BUILD_TYPE=Debug
+make
+
+# Ejecutar con GDB
+gdb ./build/chronosrt_bench
+
+# Comandos útiles de GDB
+(gdb) break ChronosRT_event_publish
+(gdb) break ChronosRT_event_subscribe
+(gdb) run --mode=latency --duration=10
+
+# Ver backtrace al llegar a breakpoint
+(gdb) bt
+
+# Examinar variables
+(gdb) p handle
+(gdb) p *event
+
+# Ver registros de CPU
+(gdb) info registers
+
+# Ver estado de threads
+(gdb) info threads
+
+# Cambiar a thread específico
+(gdb) thread 2
+```
+
+### 6.3 Análisis con perf
+
+```bash
+# Perfilado básico
+perf stat -B -e cycles,instructions,cache-references,cache-misses ./chronosrt_bench --mode=latency
+
+# Perfilado con overhead
+perf record -g ./chronosrt_bench --mode=latency --duration=30
+perf report --stdio
+
+# Flame graph
+perf record -F 99 -g ./chronosrt_bench --mode=latency --duration=60
+perf script | stackcollapse-perf.pl | flamegraph.pl > latency.svg
+
+# Analizar caché
+perf stat -e cache-misses,cache-references, LLC-misses ./chronosrt_bench --mode=throughput
+```
 
 ---
 
-## 10. HAL de aceleración — `chronosrt_hwaccel.h`
+## 7. Actualización y Mantenimiento
 
-### 10.1 Capacidades
+### 7.1 Procedimiento de Actualización
 
-```c
-typedef struct {
-    bool        crc32c_hw;
-    const char* crc32c_backend;   /* "sse4.2-x4" | "armv8-crc" | "slice-by-8" */
-    bool        fec_simd;
-    const char* fec_backend;      /* "neon" | "avx2" | "scalar"               */
-    bool        armv8_crypto;
-    bool        phc;
-    bool        launch_time;
+```bash
+#!/bin/bash
+# update_ChronosRT Master.sh
 
-    char        cpu_vendor[13];
-    char        cpu_brand[49];
-    uint32_t    cpu_family, cpu_model, cpu_stepping;
+set -e
 
-    bool isa_sse42, isa_pclmul, isa_avx, isa_avx2;
-    bool isa_avx512f, isa_avx512vl, isa_avx512bw, isa_avx512dq;
-    bool isa_vpclmul, isa_gfni, isa_vaes, isa_sha, isa_aes;
-    bool isa_bmi2, isa_adx;
-} ChronosRT_hw_caps_t;
+NEW_VERSION="1.1.0"
+BACKUP_DIR="/var/backups/ChronosRT"
+INSTALL_DIR="/opt/ChronosRT"
 
-const ChronosRT_hw_caps_t* ChronosRT_hw_caps(void);
-ChronosRT_status_t ChronosRT_hw_caps_for_interface(const char* ifname,
-                                                   ChronosRT_hw_caps_t* out);
+echo "ChronosRT Master Update Script v$NEW_VERSION"
+echo "======================================="
+
+# 1. Detener servicio actual
+echo "[1/7] Stopping current service..."
+sudo systemctl stop ChronosRT || true
+
+# 2. Crear respaldo
+echo "[2/7] Creating backup..."
+mkdir -p "$BACKUP_DIR"
+sudo cp -r "$INSTALL_DIR" "$BACKUP_DIR/ChronosRT_$(date +%Y%m%d_%H%M%S)"
+
+# 3. Descargar nueva versión
+echo "[3/7] Downloading new version..."
+wget -O /tmp/ChronosRT-$NEW_VERSION.tar.gz "https://example.com/ChronosRT-$NEW_VERSION.tar.gz"
+
+# 4. Verificar checksum
+echo "[4/7] Verifying checksum..."
+sha256sum /tmp/ChronosRT-$NEW_VERSION.tar.gz
+
+# 5. Extraer e instalar
+echo "[5/7] Extracting and installing..."
+cd /tmp
+tar -xzf ChronosRT-$NEW_VERSION.tar.gz
+cd ChronosRT-$NEW_VERSION
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
+make -j$(nproc)
+sudo make install
+
+# 6. Reiniciar servicio
+echo "[6/7] Restarting service..."
+sudo systemctl daemon-reload
+sudo systemctl start ChronosRT
+
+# 7. Verificar
+echo "[7/7] Verifying installation..."
+/opt/ChronosRT/bin/chronosrt_test
+
+echo "Update complete!"
 ```
 
-### 10.2 CRC-32C, GF(2^8) y Reed-Solomon
+### 7.2 Script de Mantenimiento Preventivo
 
-```c
-uint32_t ChronosRT_crc32c(const void* data, size_t len);
-uint32_t ChronosRT_crc32c_raw(uint32_t seed, const void* data, size_t len);
-uint32_t ChronosRT_crc32c_sw(const void* data, size_t len);
-uint32_t ChronosRT_crc32c_sw_raw(uint32_t seed, const void* data, size_t len);
+```bash
+#!/bin/bash
+# maintenance.sh - Script de mantenimiento mensual
 
-const char*        ChronosRT_crc32c_active_backend(void);
-uint32_t           ChronosRT_crc32c_selftest(const char** first_failing);
-ChronosRT_status_t ChronosRT_crc32c_force_backend(const char* name);
+LOG_FILE="/var/log/ChronosRT_maintenance.log"
 
-uint8_t ChronosRT_gf8_mul(uint8_t a, uint8_t b);
-uint8_t ChronosRT_gf8_inv(uint8_t a);
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
 
-ChronosRT_status_t ChronosRT_rs_encode(uint8_t k, uint8_t n,
-                                       const uint8_t* const* data,
-                                       uint8_t* const* parity,
-                                       uint32_t len);
-ChronosRT_status_t ChronosRT_rs_decode(uint8_t k, uint8_t n,
-                                       uint8_t* const* blocks,
-                                       const bool* present,
-                                       uint32_t len);
+log "Starting monthly maintenance"
 
-uint64_t ChronosRT_tx_timestamp_ns(void);
+# 1. Verificar espacio en disco
+log "[1/6] Checking disk space..."
+df -h / | tail -1 | awk '{print "Disk usage: " $5}'
+
+# 2. Rotar logs antiguos
+log "[2/6] Rotating old logs..."
+find /var/log/ChronosRT -name "*.log" -mtime +30 -exec gzip {} \;
+find /var/log/ChronosRT -name "*.gz" -mtime +90 -delete
+
+# 3. Verificar integridad de biblioteca
+log "[3/6] Verifying library integrity..."
+ldd /usr/local/lib/libChronosRT.so
+
+# 4. Verificar configuración
+log "[4/6] Checking configuration..."
+/opt/ChronosRT/bin/chronosrt_test --validate-config
+
+# 5. Correr tests
+log "[5/6] Running tests..."
+/opt/ChronosRT/bin/chronosrt_test || log "WARNING: Some tests failed"
+
+# 6. Reporte de métricas
+log "[6/6] Collecting metrics..."
+/opt/ChronosRT/bin/chronosrt_bench --mode=latency --duration=30 > /var/log/ChronosRT_metrics_$(date +%Y%m%d).log
+
+log "Maintenance complete"
 ```
-
-- `ChronosRT_crc32c` usa init/xorout `0xFFFFFFFF`; `_raw` permite encadenar sin
-  inversión. Vector estándar: `"123456789"` → `0xE3069283`.
-- `rs_encode/decode` usan RS(N,K) sistemático sobre GF(2^8) con polinomio
-  `0x11D`; `decode` reconstruye hasta N−K borrados.
-- `crc32c_selftest` devuelve el número de backends que **no** coinciden con la
-  referencia software (0 = todos correctos).
 
 ---
 
-## 11. Selección de protocolo — `chronosrt_protocol.h`
+## 8. Redundancia y Alta Disponibilidad
+
+### 8.1 Arquitectura de Redundancia
+
+```mermaid
+flowchart TB
+    subgraph HA["ARQUITECTURA DE ALTA DISPONIBILIDAD"]
+        direction TB
+
+        subgraph MASTERS["Masters"]
+            direction LR
+            M1["Master Primary<br/>(Active)"]
+            M2["Master Secondary<br/>(Standby)"]
+            M1 <-->|"HA Link"| M2
+        end
+
+        SW["Network Switch<br/>(Redundant)"]
+
+        subgraph NETWORKS["EtherCAT Networks (Ring)"]
+            direction LR
+            N1["EtherCAT Network"]
+            N2["EtherCAT Network"]
+        end
+
+        SLAVES["Slaves<br/>(EtherCAT Devices)"]
+
+        M1 --> SW
+        M2 --> SW
+        SW --> N1
+        SW --> N2
+        N1 --> SLAVES
+        N2 --> SLAVES
+    end
+
+    note1["Failover Sequence:<br/>1. Primary detects failure (timeout/heartbeat)<br/>2. Primary sends FAILOVER command to Secondary<br/>3. Secondary takes over network interfaces<br/>4. Failover time: < 100ms (typical)"]
+    HA --- note1
+```
+
+### 8.2 Implementación de Redundancia
 
 ```c
+// Estado del sistema HA
 typedef enum {
-    ChronosRT_PROTOCOL_ETHERCAT = 0,
-    ChronosRT_PROTOCOL_ETHERTUX  = 1
-} ChronosRT_protocol_t;
+    HA_STATE_INIT,
+    HA_STATE_STANDBY,
+    HA_STATE_ACTIVE,
+    HA_STATE_FAILING_OVER,
+    HA_STATE_FAILED
+} ha_state_t;
 
-ChronosRT_protocol_t ChronosRT_protocol_default(void);
-ChronosRT_protocol_t ChronosRT_protocol_from_string(const char* name);
-const char*          ChronosRT_protocol_name(ChronosRT_protocol_t protocol);
-ChronosRT_protocol_t ChronosRT_protocol_from_env(void);
+// Estructura HA
+typedef struct {
+    ha_state_t state;
+    uint8_t    priority;          // 0-255, mayor = preferido
+    uint32_t   heartbeat_interval; // ms
+    uint32_t   heartbeat_timeout;  // ms
+    uint64_t   last_heartbeat_ns;
+    int        socket_fd;
+    struct     sockaddr_in peer_addr;
+} ha_context_t;
+
+// Hilo de heartbeat
+void* ha_heartbeat_thread(void* arg) {
+    ha_context_t* ctx = (ha_context_t*)arg;
+    uint8_t msg[HA_MSG_SIZE];
+
+    while (ctx->state != HA_STATE_FAILED) {
+        // Enviar heartbeat
+        msg[0] = HA_MSG_HEARTBEAT;
+        msg[1] = ctx->priority;
+        *(uint64_t*)(msg + 2) = ChronosRT_get_timestamp_ns();
+
+        sendto(ctx->socket_fd, msg, sizeof(msg), 0,
+               (struct sockaddr*)&ctx->peer_addr, sizeof(ctx->peer_addr));
+
+        usleep(ctx->heartbeat_interval * 1000);
+    }
+
+    return NULL;
+}
+
+// Manejo de failover
+void handle_failover(ha_context_t* ctx) {
+    log_warning("Initiating failover");
+    ctx->state = HA_STATE_ACTIVE;
+    log_info("Failover complete, now active");
+}
 ```
-
-La elección es de **tiempo de configuración** (`CHRONOSRT_PROTOCOL=ethercat|ethertux`)
-y no cambia en caliente. Los dos backends nunca se usan a la vez sobre la misma
-interfaz.
 
 ---
 
-## 12. Maestro EtherCAT — `chronosrt_ethercat.h`
+## 9. Análisis de Rendimiento y Optimización
 
-Maestro autónomo sobre `AF_PACKET`, EtherType **0x88A4**, conforme a
-IEC 61158 / ETG.1000. Sin SOEM, IgH ni DPDK.
+### 9.1 Análisis WCET
 
-### 12.1 Límites y constantes
+ChronosRT **no publica una suma teórica de WCET**: la cota útil es la que se
+mide en el hardware y kernel reales. Para ello usa el histograma de
+`chronosrt_rt.h`:
 
 ```c
-#define ChronosRT_EC_ETHERTYPE        0x88A4
-#define ChronosRT_EC_MAX_SLAVES       64
-#define ChronosRT_EC_MAX_FRAME        1518
-#define ChronosRT_EC_MAX_DATAGRAM_DATA 1024
-#define ChronosRT_EC_MAX_SM           8
-#define ChronosRT_EC_MAX_FMMU         4
-#define ChronosRT_EC_MAX_MAILBOX      256
-#define ChronosRT_EC_MAX_INTERFACES   16
-#define ChronosRT_EC_BROADCAST_ADDR   0x0000u
-#define ChronosRT_EC_NODE_OFFSET      0x1000u
+#include <chronosrt/chronosrt_rt.h>
+
+ChronosRT_hist_t hist;
+ChronosRT_hist_init(&hist, 100);            /* buckets de 100 ns */
+
+while (running) {
+    uint64_t t0 = ChronosRT_get_timestamp_ns();
+    /* ... trabajo del ciclo ... */
+    uint64_t t1 = ChronosRT_get_timestamp_ns();
+    ChronosRT_hist_record(&hist, t1 - t0);
+}
+
+uint64_t wcet   = ChronosRT_hist_wcet_ns(&hist);
+uint64_t p999   = ChronosRT_hist_percentile_ns(&hist, 99.9);
+uint64_t sigma  = ChronosRT_hist_stddev_ns(&hist);
+uint64_t mean   = ChronosRT_hist_mean_ns(&hist);
+
+ChronosRT_hist_print(&hist, "ciclo de control");
 ```
 
-Estados AL: `ChronosRT_EC_STATE_NONE/INIT/PREOP/BOOT/SAFEOP/OP/ACK`.
-Comandos: `NOP`, `APRD/APWR/APRW`, `FPRD/FPWR/FPRW`, `BRD/BWR/BRW`,
-`LRD/LWR/LRW`, `ARMW/FRMW`.
+`ChronosRT_hist_print()` publica media, desviación, percentiles y WCET de la
+ventana medida. Repita la medición en cada plataforma: el resultado depende de
+PREEMPT_RT, `isolcpus`, *governor*, C-states y de la NIC.
 
-Registros ESC expuestos: `TYPE 0x0000`, `REVISION 0x0008`,
-`STATION_ADDR 0x0010`, `STATION_ALIAS 0x0012`, `DL_STATUS 0x0110`,
-`AL_CONTROL 0x0120`, `AL_STATUS 0x0130`, `AL_STATUS_CODE 0x0134`,
-`RX_ERROR 0x0300`, `CRC_ERROR 0x0308`, `WD_COUNTER 0x0442`,
-`DC_SYSTEM_TIME 0x0910`, `DC_SYNC_ACT 0x0981`, `DC_START0 0x0990`,
-`DC_CYCLE0 0x09A0`.
-
-### 12.2 Interfaces
+### 9.2 Optimización de Cache
 
 ```c
-uint32_t ChronosRT_ec_interface_count(void);
-const ChronosRT_ec_interface_t* ChronosRT_ec_interface(uint32_t index);
-int      ChronosRT_ec_interface_index(const char* name);
-```
-
-```c
+// Análisis de cache misses
 typedef struct {
-    char    name[32];
-    uint8_t mac[6];
-    int     ifindex;
-    bool    is_up;
-} ChronosRT_ec_interface_t;
+    uint64_t l1_misses;
+    uint64_t l2_misses;
+    uint64_t l3_misses;
+    uint64_t total_accesses;
+} cache_stats_t;
+
+// Optimización: Prefetch de datos
+void optimized_process_batch(event_batch_t* batch) {
+    for (int i = 0; i < batch->count; i++) {
+        process_event(&batch->events[i]);
+
+        if (i + 1 < batch->count) {
+            __builtin_prefetch(&batch->events[i + 1], 0, 3);
+        }
+
+        if (batch->events[i].data_ptr) {
+            __builtin_prefetch(batch->events[i].data_ptr, 0, 0);
+        }
+    }
+}
 ```
 
-### 12.3 Helpers puros de trama
+### 9.3 ID local determinista (EtherTux)
+
+Identidad de 16 bits en una MAC LAA (`02:00:00:00:ID[15:8]:ID[7:0]`) con dos
+niveles: el receptor deriva el ID candidato de la MAC (CRC-32C plegado) y el
+maestro resuelve las colisiones con un cursor secuencial determinista solo en
+admisión. El coste del camino crítico es de tiempo constante:
+
+| Operación | Coste medido | Notas |
+|---|---:|---|
+| ID candidato (CRC-32C plegado) | 5,2 ns | sin ramas ni bucles |
+| `ID → MAC` / `MAC → ID` | 0,15 / 0,8 ns | identidad en el cable |
+| Filtro de destino del maestro | 6,2 ns | descarta antes de parsear |
+| Admisión (nodo nuevo) | 62 ns | O(1) amortizado, fuera del superframe |
+| Búsqueda `{MAC → ID}` | 15,4 ns | tabla hash abierta |
+
+Con el ID activo, la recepción descarta las tramas unicast ajenas
+(`local_id_dropped`), los nodos se indexan por hash de MAC y el maestro puede
+emitir unicast con `send_to()` en lugar de difusión, lo que evita el *flooding*
+del switch. La tabla `{MAC → ID}` se persiste con reemplazo atómico.
+
+**Flujo de admisión (`ChronosRT_et_aalid_admit`):**
+
+1. Se calcula el ID candidato (CRC-32C de la MAC plegado) y se indexa la tabla.
+2. Si la MAC ya está registrada con el mismo `nonce`, se refresca su
+   `last_hb_ms` y se devuelve el ID existente (`DUPLICATE`); si el `nonce`
+   difiere, se rechaza como MAC clonada (`CLONE`, `ChronosRT_ERROR_STATE`).
+3. Si el candidato está libre en el bitmap, se asigna (`OK`). Si está ocupado,
+   `et_aalid_find_free` busca el primer hueco desde `next_free_hint` y en
+   envolvente (`COLLISION`).
+4. Se inserta en la primera ranura libre o *tombstone* de la cadena de sondeo,
+   se marca el bit y se avanza el cursor. Sin hueco, `FULL`.
+5. `expire` libera los IDs sin heartbeat dentro de `grace_ms` (10 min por
+   defecto) y deja *tombstones* reutilizables.
+
+Memoria: ≈ 14,4 KB con los valores por defecto (tabla de 256 ranuras × 24 B y
+bitmap de 8 KB). Persistencia: cabecera de 16 B (`ETID`, versión 1, número de
+entradas) y 24 B por entrada (MAC, ID, `nonce`, `last_hb_ms`), con escritura
+`tmp` + `rename`.
+
+---
+
+## 10. Seguridad y Cifrado
+
+### 10.1 Alcance real
+
+ChronosRT **no implementa cifrado, autenticación ni control de acceso**. Es una
+biblioteca de transporte y tiempo real; la seguridad se delega en el despliegue:
+
+| Capa | Responsabilidad | Herramienta |
+|---|---|---|
+| Aislamiento físico/lógico | Red exclusiva para EtherCAT/EtherTux | VLAN, switch dedicado, `macvlan` |
+| Permisos | Solo el proceso RT abre `AF_PACKET` | `CAP_NET_RAW`, usuario dedicado |
+| Filtrado | Listas de MAC/ puertos en el switch | Configuración del switch |
+| Integridad | CRC-32C por trama (EtherTux) y WKC (EtherCAT) | Ya implementado, **no es criptográfico** |
+| Confidencialidad | Opcional en el plano de gestión | Motor criptográfico del SoC, **fuera del camino crítico** |
+
+> El CRC-32C detecta corrupción accidental, **no** autentica ni cifra. No use
+> EtherTux sobre una red no confiable sin una capa externa (IPsec, MACsec o
+> aislamiento físico).
+
+### 10.2 Motores criptográficos del SoC
+
+La HAL **detecta** `armv8_crypto` (AES/SHA) y reporta el motor del SoC, pero no
+lo usa en el datapath. Los motores dedicados (`sun8i-ce`, `rk_crypto`) solo se
+contemplan para cifrado opcional del plano de gestión; `rk2_crypto` aún está en
+parcheo y no debe usarse en producción.
+
+### 10.3 Recomendaciones
+
+1. Red física o VLAN exclusiva para el bus de control.
+2. Ejecutar el proceso RT con `CAP_NET_RAW` y sin privilegios adicionales.
+3. Fijar MACs de esclavas/nodos y revisar `frames_lost`, WKC y ET-WKC.
+4. Si se requiere confidencialidad, aplicarla **fuera** del ciclo crítico
+   (gateway, IPsec/MACsec o cifrado a nivel de aplicación en P4/P5).
+
+---
+
+## 11. Maestro EtherCAT de ChronosRT
+
+### 11.1 Visión general
+
+ChronosRT Master incorpora un **maestro EtherCAT autónomo** implementado íntegramente en C11
+sobre Ethernet crudo (`AF_PACKET`, EtherType **0x88A4**), conforme a IEC 61158 / ETG.1000.
+
+Es uno de los **dos backends de red** del sistema (el otro es EtherTux, apartado 13). No existe
+transporte RAW ni conmutación de protocolo en caliente: el backend se elige al configurar.
+Cualquier aplicación puede enumerar las interfaces del sistema, abrir una de ellas como maestro
+EtherCAT y comunicarse con las esclavas mediante la API pública `chronosrt_ethercat.h`.
+
+Diseño guiado por los cuatro pilares del proyecto:
+
+| Pilar | Cómo se materializa |
+|---|---|
+| **Tiempo real** | cero asignaciones dinámicas en el camino caliente: tramas y mapa de proceso (`IOMap`) pre-asignados; el ciclo de proceso no reserva memoria ni bloquea. |
+| **Determinismo** | temporización con `CLOCK_MONOTONIC`, *timeouts* acotados y `poll()` con vencimiento absoluto; no hay esperas indefinidas. |
+| **Resiliencia absoluta** | validación por contador de trabajo (WKC), detección de esclavas perdidas, contadores de error del ESC, reintentos acotados, ACK de errores AL y redundancia de red (doble NIC). |
+| **Ultra rendimiento** | varios datagramas por trama (bit **M**), `PACKET_QDISC_BYPASS`, prioridad de socket elevada y cero copias superfluas. |
+
+> **Sin dependencias externas.** A diferencia de SOEM o del maestro IgH, este maestro no enlaza
+> ninguna biblioteca de terceros: habla directamente con la NIC a través del socket de paquetes
+> del kernel y serializa el protocolo EtherCAT en espacio de usuario.
+
+### 11.2 Arquitectura modular
+
+El maestro está dividido en seis módulos con responsabilidad única
+(`src/protocols/ethercat/`), más una cabecera interna compartida:
+
+| Módulo | Responsabilidad |
+|---|---|
+| [`ec_internal.h`](file:///mnt/netac/MI_MUNDO/PROYECTOS/KLIPPER/PROYECTOS/ChronosRT_MASTER/src/protocols/ethercat/ec_internal.h) | Geometría de trama, registros ESC, *structs* internas y prototipos compartidos. |
+| [`ec_frame.c`](file:///mnt/netac/MI_MUNDO/PROYECTOS/KLIPPER/PROYECTOS/ChronosRT_MASTER/src/protocols/ethercat/ec_frame.c) | Serialización/parseo puro de datagramas y tramas (testeable sin hardware). |
+| [`ec_socket.c`](file:///mnt/netac/MI_MUNDO/PROYECTOS/KLIPPER/PROYECTOS/ChronosRT_MASTER/src/protocols/ethercat/ec_socket.c) | Socket `AF_PACKET` de tiempo real, redundancia doble NIC y enumeración de interfaces. |
+| [`ec_master.c`](file:///mnt/netac/MI_MUNDO/PROYECTOS/KLIPPER/PROYECTOS/ChronosRT_MASTER/src/protocols/ethercat/ec_master.c) | Ciclo de vida, intercambio de datagramas y ciclo de datos de proceso (PDO). |
+| [`ec_slave.c`](file:///mnt/netac/MI_MUNDO/PROYECTOS/KLIPPER/PROYECTOS/ChronosRT_MASTER/src/protocols/ethercat/ec_slave.c) | Escaneo del bus, SII/EEPROM, Sync Managers, FMMU y máquina de estados AL. |
+| [`ec_dc.c`](file:///mnt/netac/MI_MUNDO/PROYECTOS/KLIPPER/PROYECTOS/ChronosRT_MASTER/src/protocols/ethercat/ec_dc.c) | Relojes distribuidos (Distributed Clocks): SYSTIME, retardos, SYNC0/SYNC1. |
+| [`ec_mailbox.c`](file:///mnt/netac/MI_MUNDO/PROYECTOS/KLIPPER/PROYECTOS/ChronosRT_MASTER/src/protocols/ethercat/ec_mailbox.c) | Buzón (SM0/SM1) y CoE: lectura/escritura de objetos SDO (expedita y segmentada). |
+
+### 11.3 Capa de red (socket de tiempo real)
+
+Apertura del socket en [`ec_socket.c`](file:///mnt/netac/MI_MUNDO/PROYECTOS/KLIPPER/PROYECTOS/ChronosRT_MASTER/src/protocols/ethercat/ec_socket.c):
 
 ```c
-uint32_t ChronosRT_ec_datagram_build(uint8_t* out, uint32_t out_size,
-                                     uint8_t cmd, uint8_t idx,
-                                     uint32_t address,
-                                     const void* data, uint16_t len,
-                                     bool more);
-uint32_t ChronosRT_ec_datagram_parse(const uint8_t* in, uint32_t in_len,
-                                     ChronosRT_ec_datagram_t* out);
-uint16_t ChronosRT_ec_frame_header(uint8_t out[2], uint16_t datagram_bytes);
+int fd = socket(AF_PACKET, SOCK_RAW, htons(ChronosRT_EC_ETHERTYPE)); /* 0x88A4 */
+/* bind al ifindex (sin dirección IP) … */
 ```
 
-`address = ADP | (ADO << 16)`. `more = true` activa el bit M.
+Opciones aplicadas para latencia y determinismo:
 
-### 12.4 Ciclo de vida
+| Opción | Efecto |
+|---|---|
+| `PACKET_MR_PROMISC` | Recibe todas las tramas, incluidas las destinadas a esclavas. |
+| `PACKET_MR_MULTICAST` | Suscripción a direcciones de grupo (EtherCAT las usa). |
+| `PACKET_QDISC_BYPASS` | Elude la disciplina de colas del kernel (menos latencia y *jitter*). |
+| `SO_PRIORITY = 6` | Marca de prioridad elevada en la pila de red. |
 
-```c
-ChronosRT_ec_master_t* ChronosRT_ec_master_create(void);
-ChronosRT_status_t ChronosRT_ec_master_open(ChronosRT_ec_master_t* master, const char* ifname);
-ChronosRT_status_t ChronosRT_ec_master_open_redundant(ChronosRT_ec_master_t* master,
-                                                      const char* ifname,
-                                                      const char* redundant_ifname);
-void               ChronosRT_ec_master_close(ChronosRT_ec_master_t* master);
-void               ChronosRT_ec_master_destroy(ChronosRT_ec_master_t* master);
-bool               ChronosRT_ec_master_is_open(const ChronosRT_ec_master_t* master);
-const char*        ChronosRT_ec_master_interface(const ChronosRT_ec_master_t* master);
-void               ChronosRT_ec_master_set_timeout(ChronosRT_ec_master_t* master,
-                                                   uint32_t timeout_us);
+- **Recepción:** `poll()` sobre el *fd* con **vencimiento monotónico**; se filtran las tramas por
+  EtherType `0x88A4` y se descartan las ajenas.
+- **Redundancia de red (doble NIC):** `ChronosRT_ec_master_open_redundant()` abre una interfaz
+  primaria y otra secundaria; cada trama se **transmite por ambas** y se acepta la primera
+  respuesta válida (patrón de resiliencia de EtherCAT).
+- **Enumeración de interfaces:** `getifaddrs(AF_PACKET)` alimenta
+  `ChronosRT_ec_interface_count/interface/interface_index`, para que la aplicación elija la NIC.
+
+**Requisitos de despliegue:** la apertura requiere privilegio **`CAP_NET_RAW`** (o `root`) y una
+interfaz de red activa. Son las únicas dependencias de ejecución del maestro.
+
+### 11.4 Protocolo EtherCAT
+
+**Direccionamiento** (`address = ADP | (ADO << 16)`):
+
+- **Posición (auto-incremento)** — para el escaneo del anillo (`APRD/APWR`).
+- **Dirección de estación configurada** — para `FPRD/FPWR` tras `config_init`.
+- **Dirección lógica** — para los datos de proceso (`LRD/LWR/LRW`).
+
+**Comandos** (`ChronosRT_ec_cmd_t`): `NOP`, `APRD/APWR/APRW`, `FPRD/FPWR/FPRW`, `BRD/BWR/BRW`,
+`LRD/LWR/LRW` y `ARMW/FRMW` (lectura + escritura múltiple, usados por DC).
+
+**Contador de trabajo (WKC):** cada datagrama devuelve cuántas esclavas lo procesaron. El maestro
+valida la respuesta contra un **WKC esperado** calculado al configurar el mapa de proceso:
+
+```
+WKC esperado = 2 × (esclavas con salidas) + 1 × (esclavas con entradas)
 ```
 
-### 12.5 Escaneo y configuración
+Una respuesta con `WKC < esperado` indica esclavas ausentes o tramas perdidas en ese ciclo.
+
+**Varios datagramas por trama:** el **bit M** (`0x8000` del campo de longitud) encadena datagramas
+en una sola trama Ethernet, reduciendo el número de envíos por ciclo.
+
+### 11.5 Escaneo y configuración de esclavas
+
+Secuencia estándar de puesta en marcha:
+
+1. **`ChronosRT_ec_master_scan()`** — recorre el anillo por auto-incremento leyendo
+   `STATION_ADDR`/`ALIAS` y `DL_STATUS`; se detiene en la primera posición que no responde.
+2. **`ChronosRT_ec_master_config_init()`** — para cada esclava: asigna la dirección de estación
+   (`posición + ChronosRT_EC_NODE_OFFSET`), lee `ESCSUP` (soporte DC), `TYPE`, la **SII/EEPROM**
+   (fabricante, producto, revisión, serie, buzón) y los **Sync Managers** SM0…SM7.
+3. **`ChronosRT_ec_master_config_map()`** — en dos pasadas (salidas SM2 → entradas SM3) calcula
+   los *offsets* del **IOMap**, programa las **FMMU** (FMMU0 = escritura de salidas, FMMU1 =
+   lectura de entradas) y configura SM2/SM3; finalmente fija el `expected_wkc`.
+
+Registros ESC empleados (`ChronosRT_EC_REG_*`): `TYPE 0x0000`, `STATION_ADDR 0x0010`,
+`ALIAS 0x0012`, `DL_STATUS 0x0110`, `AL_CONTROL 0x0120`, `AL_STATUS 0x0130`,
+`AL_STATUS_CODE 0x0134`, `RX_ERROR 0x0300`, `CRC_ERROR 0x0308`, `WD_COUNTER 0x0442`,
+FMMU `0x0600`, SM `0x0800`, `DC_* 0x0900–0x09A4`.
+
+**SII/EEPROM:** lectura vía `EEPADDR`/`EEPCTL`/`EEPSTAT`/`EEPDAT` con sondeo del bit *BUSY*,
+según el procedimiento ETG.1000.
+
+### 11.6 Máquina de estados AL (ESM)
+
+Estados: `INIT` → `PREOP` → `SAFEOP` → `OP` (y `BOOT`); el bit de **ACK de error** (`0x10`) se
+OR-ea para confirmar y limpiar errores.
+
+- **`ChronosRT_ec_master_request_state()`** — escribe el registro de control AL, espera la
+  transición (sondeo con *timeout*) y emite el ACK cuando la esclava reporta error.
+- **`ChronosRT_ec_master_request_all_states()`** — lleva **todas** las esclavas al estado pedido
+  con un `BWR` de difusión al `AL_CONTROL` y espera; **degrada con elegancia** contando las
+  esclavas que sí alcanzan el estado en lugar de abortar.
+
+### 11.7 Distributed Clocks (DC)
+
+- **`ChronosRT_ec_master_config_dc()`** — lee `SYSTIME` de la primera esclava con DC, mide los
+  retardos de propagación (`DCTIME0–3`), propaga el tiempo de referencia al bus y compensa el
+  *offset* de reloj.
+- **`ChronosRT_ec_master_sync0()` / `sync01()`** — programan `DCCYCLE0/1` y `DCSTART0/1` y activan
+  las señales **SYNC0/SYNC1** para sincronizar el ciclo de proceso con las esclavas.
+- **`ChronosRT_ec_master_dc_time()`** — devuelve el último tiempo de sistema DC leído (ns).
+
+### 11.8 Buzón y CoE (SDO)
+
+- **`ChronosRT_ec_master_sdo_read()`** (upload) y **`ChronosRT_ec_master_sdo_write()`** (download)
+  acceden a objetos CoE por `index`/`subindex` sobre el buzón SM0/SM1.
+- Soporta transferencia **expedita** (≤ 4 B) y **segmentada** (con bit *toggle*), codificando la
+  cabecera de buzón (6 B) y la de CoE/SDO según ETG.1000.
+- La espera de hueco en el buzón (`SM_STATUS` libre/lleno) es acotada por `EC_TIMEOUT_MBX`.
+
+### 11.9 Ciclo de datos de proceso (PDO)
 
 ```c
-int      ChronosRT_ec_master_scan(ChronosRT_ec_master_t* master);
-int      ChronosRT_ec_master_config_init(ChronosRT_ec_master_t* master);
-int      ChronosRT_ec_master_config_map(ChronosRT_ec_master_t* master);
-uint32_t ChronosRT_ec_master_slave_count(const ChronosRT_ec_master_t* master);
-const ChronosRT_ec_slave_t* ChronosRT_ec_master_slave(const ChronosRT_ec_master_t* master,
-                                                      uint32_t index);
-const uint8_t* ChronosRT_ec_master_iomap(const ChronosRT_ec_master_t* master);
-uint32_t       ChronosRT_ec_master_iomap_size(const ChronosRT_ec_master_t* master);
+/* Enviar las salidas (RxPDO) del IOMap y recibir las entradas (TxPDO) */
+ChronosRT_ec_master_send_processdata(master);
+ChronosRT_ec_master_receive_processdata(master, timeout_us);
+
+const uint8_t* io = ChronosRT_ec_master_iomap(master);
+/* io[o_offset .. o_offset+o_bytes) → salidas de cada esclava
+   io[i_offset .. i_offset+i_bytes) → entradas de cada esclava          */
 ```
 
-```c
-typedef struct {
-    uint16_t position, station_addr, alias, config_addr;
-    uint32_t vendor_id, product_code, revision, serial;
-    uint8_t  al_state;
-    uint16_t al_status_code, dl_status;
-    uint8_t  ports;
-    bool     has_dc, is_lost;
-    uint16_t mbx_proto;
-    uint32_t i_bytes, o_bytes;
-    uint32_t i_offset, o_offset;
-    int64_t  dc_offset;
-    int32_t  dc_delay;
-} ChronosRT_ec_slave_t;
-```
+`send_processdata()` emite un **LRW** con el IOMap; `receive_processdata()` valida el **WKC** y
+copia las entradas. Ambos son aptos para un bucle periódico de tiempo real.
 
-### 12.6 Registros y direccionamiento
+### 11.10 API pública
 
-```c
-int ChronosRT_ec_master_read_reg(...);        /* APRD  */
-int ChronosRT_ec_master_write_reg(...);       /* APWR  */
-int ChronosRT_ec_master_fp_read(...);         /* FPRD  */
-int ChronosRT_ec_master_fp_write(...);        /* FPWR  */
-int ChronosRT_ec_master_broadcast_read(...);  /* BRD   */
-int ChronosRT_ec_master_broadcast_write(...); /* BWR   */
-int ChronosRT_ec_master_lrw(...);             /* LRW   */
-int ChronosRT_ec_master_lrd(...);             /* LRD   */
-int ChronosRT_ec_master_lwr(...);             /* LWR   */
-int ChronosRT_ec_master_armw(...);            /* ARMW  */
-int ChronosRT_ec_master_frmw(...);            /* FRMW  */
-```
+La API (`chronosrt_ethercat.h`) se agrupa en:
 
-### 12.7 Máquina de estados AL
+| Grupo | Funciones |
+|---|---|
+| **Interfaces** | `interface_count`, `interface`, `interface_index` |
+| **Helpers puros** | `datagram_build`, `datagram_parse`, `frame_header` |
+| **Ciclo de vida** | `master_create`, `master_open`, `master_open_redundant`, `master_close`, `master_destroy`, `master_is_open`, `master_interface`, `master_set_timeout` |
+| **Escaneo/config** | `master_scan`, `master_config_init`, `master_config_map`, `master_slave_count`, `master_slave`, `master_iomap`, `master_iomap_size` |
+| **Registros** | `master_read_reg`, `master_write_reg`, `master_fp_read`, `master_fp_write`, `master_broadcast_read`, `master_broadcast_write` |
+| **Lógicos** | `master_lrw`, `master_lrd`, `master_lwr`, `master_armw`, `master_frmw` |
+| **Estados AL** | `master_read_state`, `master_request_state`, `master_statecheck`, `master_write_state`, `master_request_all_states` |
+| **Relojes (DC)** | `master_config_dc`, `master_sync0`, `master_sync01`, `master_dc_time` |
+| **PDO** | `master_send_processdata`, `master_receive_processdata` |
+| **CoE/SDO** | `master_sdo_read`, `master_sdo_write` |
+| **Diagnóstico** | `master_working_counter`, `master_expected_wkc`, `master_frames_sent`, `master_frames_lost` |
+| **Crudo** | `master_send`, `master_recv` |
+
+### 11.11 Ejemplo de uso
 
 ```c
-int ChronosRT_ec_master_read_state(master, adp, uint8_t* state, uint16_t* status_code);
-int ChronosRT_ec_master_request_state(master, adp, uint8_t state, uint32_t timeout_us);
-int ChronosRT_ec_master_statecheck(master, adp, uint8_t req_state, uint32_t timeout_us);
-int ChronosRT_ec_master_write_state(master, adp, uint8_t state);
-int ChronosRT_ec_master_request_all_states(master, uint8_t state, uint32_t timeout_us);
-```
+#include "chronosrt_ethercat.h"
 
-`request_all_states` usa `BWR` al `AL_CONTROL` y degrada elegantemente contando
-las esclavas que alcanzan el estado.
-
-### 12.8 Distributed Clocks y PDO
-
-```c
-ChronosRT_status_t ChronosRT_ec_master_config_dc(ChronosRT_ec_master_t* master);
-int      ChronosRT_ec_master_sync0(master, uint32_t index, bool act,
-                                   uint32_t cycle_ns, int32_t shift_ns);
-int      ChronosRT_ec_master_sync01(master, uint32_t index, bool act,
-                                    uint32_t cycle0_ns, int32_t shift0_ns,
-                                    uint32_t cycle1_ns, int32_t shift1_ns);
-int64_t  ChronosRT_ec_master_dc_time(const ChronosRT_ec_master_t* master);
-
-int ChronosRT_ec_master_send_processdata(ChronosRT_ec_master_t* master);
-int ChronosRT_ec_master_receive_processdata(ChronosRT_ec_master_t* master,
-                                            uint32_t timeout_us);
-```
-
-### 12.9 Buzón / CoE (SDO)
-
-```c
-ChronosRT_status_t ChronosRT_ec_master_sdo_read(master, uint32_t slave_index,
-                                                uint16_t index, uint8_t subindex,
-                                                void* out, uint32_t* size,
-                                                uint32_t timeout_us);
-ChronosRT_status_t ChronosRT_ec_master_sdo_write(master, uint32_t slave_index,
-                                                 uint16_t index, uint8_t subindex,
-                                                 const void* in, uint32_t size,
-                                                 uint32_t timeout_us);
-```
-
-Requiere la esclava en `PREOP` o superior (buzón activo).
-
-### 12.10 Diagnóstico y acceso crudo
-
-```c
-uint16_t ChronosRT_ec_master_working_counter(const ChronosRT_ec_master_t* master);
-uint16_t ChronosRT_ec_master_expected_wkc(const ChronosRT_ec_master_t* master);
-uint64_t ChronosRT_ec_master_frames_sent(const ChronosRT_ec_master_t* master);
-uint64_t ChronosRT_ec_master_frames_lost(const ChronosRT_ec_master_t* master);
-
-int ChronosRT_ec_master_send(ChronosRT_ec_master_t* master,
-                             const uint8_t* datagrams, uint32_t len);
-int ChronosRT_ec_master_recv(ChronosRT_ec_master_t* master,
-                             uint8_t* buffer, uint32_t bufsize,
-                             uint32_t timeout_us);
-```
-
-### 12.11 Ejemplo
-
-```c
 ChronosRT_ec_master_t* m = ChronosRT_ec_master_create();
-ChronosRT_ec_master_open(m, "enp2s0");
+
+/* 1. Abrir la NIC como maestro EtherCAT */
+if (ChronosRT_ec_master_open(m, "enp2s0") != ChronosRT_SUCCESS) {
+    /* degradación elegante: sin CAP_NET_RAW o interfaz ausente */
+    ChronosRT_ec_master_destroy(m);
+    return -1;
+}
+
+/* 2. Descubrir y configurar el bus */
 int n = ChronosRT_ec_master_scan(m);
 ChronosRT_ec_master_config_init(m);
 ChronosRT_ec_master_config_map(m);
-ChronosRT_ec_master_request_all_states(m, ChronosRT_EC_STATE_OP, 2000000);
 
+/* 3. Llevar el bus a OP (degradación elegante si falta alguna esclava) */
+ChronosRT_ec_master_request_all_states(m, ChronosRT_EC_STATE_OP, 50000);
+
+/* 4. Ciclo de proceso en tiempo real */
+const uint8_t* io = ChronosRT_ec_master_iomap(m);
 while (running) {
     ChronosRT_ec_master_send_processdata(m);
-    if (ChronosRT_ec_master_receive_processdata(m, 1000) < 0) {
-        continue;   /* WKC insuficiente o trama perdida */
+    if (ChronosRT_ec_master_receive_processdata(m, 2000) != 0) {
+        /* WKC insuficiente: esclava perdida o trama perdida */
     }
-    /* leer/escribir el IOMap */
+    /* leer entradas / escribir salidas en `io` */
 }
 
 ChronosRT_ec_master_close(m);
 ChronosRT_ec_master_destroy(m);
 ```
 
----
-
-## 13. EtherTux — `chronosrt_ethertux.h`
-
-Protocolo determinista sobre Ethernet comercial (`AF_PACKET`, EtherType
-**0x88B5**). Cabecera en el cable: **26 B**.
-
-### 13.1 Constantes y tipos de trama
-
-```c
-#define ChronosRT_ET_ETHERTYPE     0x88B5
-#define ChronosRT_ET_HEADER_SIZE   26u
-#define ChronosRT_ET_ETH_HDR_SIZE  14u
-#define ChronosRT_ET_MAX_FRAME     1518u
-#define ChronosRT_ET_MAX_PAYLOAD   1478u
-#define ChronosRT_ET_MAX_NODES     64u
-#define ChronosRT_ET_MAX_FLOWS     255u
-#define ChronosRT_ET_PRIORITIES    6u
-#define ChronosRT_ET_P0_MAX_FRAME  64u
-
-typedef enum {
-    ChronosRT_ET_TYPE_DATA            = 0x01,
-    ChronosRT_ET_TYPE_FEC             = 0x02,
-    ChronosRT_ET_TYPE_CONTROL         = 0x03,
-    ChronosRT_ET_TYPE_SYNC            = 0x04,
-    ChronosRT_ET_TYPE_LAPM            = 0x05,
-    ChronosRT_ET_TYPE_DISCOVERY       = 0x06,
-    ChronosRT_ET_TYPE_SYNC_CALIBRATED = 0x07,
-    ChronosRT_ET_TYPE_STATE_CHANGE    = 0x08,
-    ChronosRT_ET_TYPE_MAILBOX_DATA    = 0x09,
-    ChronosRT_ET_TYPE_MAILBOX_ACK     = 0x0A,
-    ChronosRT_ET_TYPE_SYNC_REPORT     = 0x0B,
-    ChronosRT_ET_TYPE_TOPO_CHECK      = 0x0C
-} ChronosRT_et_type_t;
-
-typedef enum {
-    ChronosRT_ET_P0 = 0, ... ChronosRT_ET_P5 = 5
-} ChronosRT_et_priority_t;
-
-typedef enum {
-    ChronosRT_ET_STATE_INIT = 0,
-    ChronosRT_ET_STATE_CONFIG,
-    ChronosRT_ET_STATE_SAFE,
-    ChronosRT_ET_STATE_OP,
-    ChronosRT_ET_STATE_FAULT
-} ChronosRT_et_state_t;
-```
-
-Flags: `FEC 0x01`, `PREEMPTABLE 0x02`, `EXPRESS 0x04`, `DISCOVERY 0x08`,
-`FRM 0x10`.
-
-### 13.2 Cabecera
-
-```c
-typedef struct {
-    uint8_t  type;
-    uint8_t  priority;
-    uint8_t  flags;
-    uint8_t  state;          /* ET-ESM del emisor */
-    uint8_t  flow_id;        /* 1..255            */
-    uint32_t seq_num;
-    uint64_t tx_timestamp;   /* ns monotónicos    */
-    uint16_t wkc;            /* ET-WKC            */
-    uint16_t block_id;       /* (bloque << 8) | índice */
-    uint8_t  flow_count;     /* 1 = sin agregación */
-    uint32_t crc32;          /* CRC-32C cabecera + carga */
-} ChronosRT_et_header_t;
-```
-
-### 13.3 Trama, CRC y física del enlace
-
-```c
-uint32_t ChronosRT_et_header_build(uint8_t out[ChronosRT_ET_HEADER_SIZE],
-                                   const ChronosRT_et_header_t* h);
-uint32_t ChronosRT_et_pdu_build(uint8_t* out, uint32_t out_size,
-                                const ChronosRT_et_header_t* h,
-                                const void* payload, uint16_t len);
-uint32_t ChronosRT_et_pdu_build_header(uint8_t out[ChronosRT_ET_HEADER_SIZE],
-                                       const ChronosRT_et_header_t* h,
-                                       const void* payload, uint16_t len);
-uint32_t ChronosRT_et_pdu_parse(const uint8_t* in, uint32_t in_len,
-                                ChronosRT_et_header_t* h,
-                                const uint8_t** payload);
-uint32_t ChronosRT_et_crc(const ChronosRT_et_header_t* h,
-                          const void* payload, uint16_t len);
-const char* ChronosRT_et_type_name(ChronosRT_et_type_t type);
-
-uint32_t ChronosRT_et_wire_frame_bytes(uint32_t payload_len);
-uint32_t ChronosRT_et_wire_pps(uint64_t link_bps, uint32_t payload_len);
-uint32_t ChronosRT_et_payload_for_pps(uint64_t link_bps, uint32_t pps);
-```
-
-`pdu_build_header` calcula el CRC sobre cabecera + carga y devuelve **solo** los
-26 B de cabecera, sin copiar la carga (envío con `sendmsg`/iovec).
-
-### 13.4 FEC Reed-Solomon
-
-```c
-typedef enum {
-    ChronosRT_ET_FEC_OFF    = 0,
-    ChronosRT_ET_FEC_LIGHT  = 1,   /* RS(10,8): 25 % de overhead  */
-    ChronosRT_ET_FEC_ROBUST = 2    /* RS(16,8): 100 % de overhead */
-} ChronosRT_et_fec_mode_t;
-
-ChronosRT_et_fec_t* ChronosRT_et_fec_create(uint8_t k, uint8_t n);
-ChronosRT_et_fec_t* ChronosRT_et_fec_create_mode(ChronosRT_et_fec_mode_t mode);
-void                ChronosRT_et_fec_destroy(ChronosRT_et_fec_t* fec);
-uint8_t             ChronosRT_et_fec_k(const ChronosRT_et_fec_t* fec);
-uint8_t             ChronosRT_et_fec_n(const ChronosRT_et_fec_t* fec);
-uint32_t            ChronosRT_et_fec_overhead_percent(const ChronosRT_et_fec_t* fec);
-ChronosRT_status_t  ChronosRT_et_fec_encode(const ChronosRT_et_fec_t* fec,
-                                            const uint8_t* const* data,
-                                            uint8_t* const* parity, uint32_t len);
-ChronosRT_status_t  ChronosRT_et_fec_decode(const ChronosRT_et_fec_t* fec,
-                                            uint8_t* const* blocks,
-                                            const bool* present, uint32_t len);
-```
-
-### 13.5 QoS jerárquico, backpressure y LAPM
-
-```c
-typedef struct {
-    uint64_t rate_bytes_per_sec;
-    uint32_t burst_bytes;
-} ChronosRT_et_bucket_cfg_t;
-
-typedef struct {
-    ChronosRT_et_bucket_cfg_t bucket[ChronosRT_ET_PRIORITIES];
-    uint8_t pause_percent;
-    bool    lapm_enabled;
-    uint8_t lapm_high_percent;
-    uint8_t lapm_low_percent;
-} ChronosRT_et_qos_config_t;
-
-typedef struct {
-    uint64_t admitted, backpressure, dropped, degraded, bytes_admitted;
-} ChronosRT_et_qos_stats_t;
-
-ChronosRT_et_qos_t* ChronosRT_et_qos_create(void);
-void                ChronosRT_et_qos_destroy(ChronosRT_et_qos_t* qos);
-void                ChronosRT_et_qos_default_config(ChronosRT_et_qos_config_t* cfg);
-ChronosRT_status_t  ChronosRT_et_qos_configure(ChronosRT_et_qos_t* qos,
-                                               const ChronosRT_et_qos_config_t* cfg);
-ChronosRT_status_t  ChronosRT_et_qos_admit(ChronosRT_et_qos_t* qos,
-                                           uint8_t priority, uint32_t bytes,
-                                           uint64_t now_ns);
-bool                ChronosRT_et_qos_backpressure(const ChronosRT_et_qos_t* qos,
-                                                  uint8_t priority);
-uint8_t             ChronosRT_et_qos_effective_priority(const ChronosRT_et_qos_t* qos,
-                                                        uint8_t priority);
-ChronosRT_status_t  ChronosRT_et_qos_stats(const ChronosRT_et_qos_t* qos,
-                                           ChronosRT_et_qos_stats_t* out);
-void                ChronosRT_et_qos_reset_stats(ChronosRT_et_qos_t* qos);
-```
-
-`admit` devuelve `SUCCESS`, `ERROR_BACKPRESSURE` (P0–P4, no se pierde) o
-`ERROR_DROPPED` (P5 best-effort).
-
-### 13.6 Planificador time-triggered
-
-```c
-typedef struct {
-    uint8_t  priority;
-    uint16_t node;
-    uint16_t frame_bytes;
-    uint32_t offset_ns;
-} ChronosRT_et_slot_t;
-
-ChronosRT_et_sched_t* ChronosRT_et_sched_create(uint32_t cycle_ns, uint64_t link_bps);
-void                  ChronosRT_et_sched_destroy(ChronosRT_et_sched_t* sched);
-ChronosRT_status_t    ChronosRT_et_sched_set_windows(ChronosRT_et_sched_t* sched,
-                                                     uint32_t control_ns,
-                                                     uint32_t deterministic_ns,
-                                                     uint32_t rate_ns,
-                                                     uint32_t best_effort_ns);
-ChronosRT_status_t    ChronosRT_et_sched_add_slot(ChronosRT_et_sched_t* sched,
-                                                  uint8_t priority, uint16_t node,
-                                                  uint16_t frame_bytes, uint32_t offset_ns);
-int                   ChronosRT_et_sched_remove_node(ChronosRT_et_sched_t* sched, uint16_t node);
-uint32_t              ChronosRT_et_sched_slot_count(const ChronosRT_et_sched_t* sched);
-bool                  ChronosRT_et_sched_slot(const ChronosRT_et_sched_t* sched,
-                                               uint32_t index, ChronosRT_et_slot_t* out);
-uint32_t              ChronosRT_et_sched_cycle_ns(const ChronosRT_et_sched_t* sched);
-uint8_t               ChronosRT_et_sched_window_at(const ChronosRT_et_sched_t* sched,
-                                                    uint64_t now_ns);
-bool                  ChronosRT_et_sched_can_transmit(const ChronosRT_et_sched_t* sched,
-                                                       uint8_t priority, uint64_t now_ns);
-uint64_t              ChronosRT_et_tx_time_ns(uint32_t frame_bytes, uint64_t link_bps);
-```
-
-Ventanas: `0` control, `1` determinista, `2` rate-constrained, `3` best-effort.
-
-### 13.7 Flow Aggregator
-
-```c
-typedef struct {
-    uint8_t        flow_id;
-    uint16_t       len;
-    const uint8_t* data;
-} ChronosRT_et_flow_entry_t;
-
-ChronosRT_status_t ChronosRT_et_flowagg_build(const ChronosRT_et_flow_entry_t* entries,
-                                              uint32_t count,
-                                              uint8_t* out, uint32_t out_size,
-                                              uint32_t* out_len);
-ChronosRT_status_t ChronosRT_et_flowagg_parse(const uint8_t* in, uint32_t len,
-                                              ChronosRT_et_flow_entry_t* views,
-                                              uint32_t max_views, uint32_t* out_count);
-uint32_t           ChronosRT_et_flowagg_saved_bytes(uint32_t count, uint32_t data_bytes);
-```
-
-### 13.8 ET-ESM (ciclo de vida del nodo)
-
-```c
-ChronosRT_et_esm_t*     ChronosRT_et_esm_create(void);
-void                    ChronosRT_et_esm_destroy(ChronosRT_et_esm_t* esm);
-void                    ChronosRT_et_esm_reset(ChronosRT_et_esm_t* esm);
-ChronosRT_et_state_t    ChronosRT_et_esm_state(const ChronosRT_et_esm_t* esm);
-bool                    ChronosRT_et_esm_can_transition(ChronosRT_et_state_t from,
-                                                        ChronosRT_et_state_t to);
-ChronosRT_status_t      ChronosRT_et_esm_request(ChronosRT_et_esm_t* esm,
-                                                 ChronosRT_et_state_t next);
-bool                    ChronosRT_et_esm_allows_traffic(ChronosRT_et_state_t state,
-                                                        uint8_t type, uint8_t priority);
-uint32_t                ChronosRT_et_esm_build_state_change(ChronosRT_et_state_t target,
-                                                            uint8_t reason, uint8_t out[2]);
-ChronosRT_status_t      ChronosRT_et_esm_parse_state_change(const uint8_t* in, uint32_t len,
-                                                            ChronosRT_et_state_t* target,
-                                                            uint8_t* reason);
-bool                    ChronosRT_et_esm_state_from_wire(uint8_t raw,
-                                                          ChronosRT_et_state_t* out);
-```
-
-Transiciones válidas: `INIT → CONFIG → SAFE → OP`; cualquiera → `FAULT`;
-`FAULT → INIT`.
-
-### 13.9 ET-Sync y monitor de ventana
-
-```c
-typedef enum {
-    ChronosRT_ET_SYNC_OK = 0,
-    ChronosRT_ET_SYNC_WARN = 1,
-    ChronosRT_ET_SYNC_OUT_OF_SYNC = 2
-} ChronosRT_et_sync_status_t;
-
-typedef struct {
-    uint32_t warn_threshold_ns;         /* def. 1 µs  */
-    uint32_t out_of_sync_threshold_ns;  /* def. 2 µs  */
-    uint32_t report_period_frames;      /* def. 10    */
-} ChronosRT_et_sync_config_t;
-
-typedef struct {
-    uint32_t nodes, ok, warn, out_of_sync;
-    uint64_t max_abs_offset_ns;
-} ChronosRT_et_sync_stats_t;
-
-ChronosRT_et_sync_t* ChronosRT_et_sync_create(void);
-void                 ChronosRT_et_sync_destroy(ChronosRT_et_sync_t* sync);
-void                 ChronosRT_et_sync_default_config(ChronosRT_et_sync_config_t* cfg);
-ChronosRT_status_t   ChronosRT_et_sync_configure(ChronosRT_et_sync_t* sync,
-                                                 const ChronosRT_et_sync_config_t* cfg);
-ChronosRT_status_t   ChronosRT_et_sync_set_link_delay(ChronosRT_et_sync_t* sync,
-                                                      uint16_t node_id, uint32_t delay_ns);
-ChronosRT_status_t   ChronosRT_et_sync_process_report(ChronosRT_et_sync_t* sync,
-                                                      uint16_t node_id,
-                                                      int64_t measured_offset_ns,
-                                                      uint64_t now_ns,
-                                                      ChronosRT_et_sync_status_t* out_status);
-ChronosRT_status_t   ChronosRT_et_sync_status_of(const ChronosRT_et_sync_t* sync,
-                                                 uint16_t node_id, int64_t* offset_ns,
-                                                 ChronosRT_et_sync_status_t* out_status);
-ChronosRT_status_t   ChronosRT_et_sync_drift_ppb(const ChronosRT_et_sync_t* sync,
-                                                 uint16_t node_id, int64_t* out_ppb);
-ChronosRT_status_t   ChronosRT_et_sync_stats(const ChronosRT_et_sync_t* sync,
-                                             ChronosRT_et_sync_stats_t* out);
-uint32_t             ChronosRT_et_sync_build_calibrated(uint64_t master_ns, uint8_t out[8]);
-ChronosRT_status_t   ChronosRT_et_sync_parse_calibrated(const uint8_t* in, uint32_t len,
-                                                        uint64_t* out_master_ns);
-uint32_t             ChronosRT_et_sync_build_report(int64_t offset_ns, uint8_t out[8]);
-ChronosRT_status_t   ChronosRT_et_sync_parse_report(const uint8_t* in, uint32_t len,
-                                                    int64_t* out_offset_ns);
-```
-
-### 13.10 Registro de nodos, ET-WKC y Hot Connect
-
-```c
-typedef struct {
-    uint16_t id;
-    uint8_t  mac[6];
-    uint16_t link_mbps;
-    uint16_t buffer_bytes;
-    bool     fec_supported;
-    uint16_t slot;                 /* 0xFFFF = libre */
-    ChronosRT_et_state_t state;
-    uint16_t last_wkc;
-    uint16_t expected_wkc;
-    uint8_t  wkc_mismatch_count;
-    int64_t  sync_offset_ns;
-    ChronosRT_et_sync_status_t sync_status;
-    uint64_t last_seen_ns;
-} ChronosRT_et_node_info_t;
-
-typedef struct {
-    uint8_t  wkc_mismatch_threshold;      /* def. 3   */
-    uint32_t hot_connect_period_frames;   /* def. 100 */
-    uint32_t heartbeat_timeout_frames;    /* def. 3   */
-} ChronosRT_et_topology_config_t;
-
-#define ChronosRT_ET_SLOT_FREE 0xFFFFu
-#define ChronosRT_ET_DISCOVERY_REPLY_SIZE 8u
-```
-
-```c
-ChronosRT_et_topology_t* ChronosRT_et_topology_create(void);
-void                     ChronosRT_et_topology_destroy(ChronosRT_et_topology_t* topo);
-void                     ChronosRT_et_topology_default_config(ChronosRT_et_topology_config_t* cfg);
-ChronosRT_status_t       ChronosRT_et_topology_configure(ChronosRT_et_topology_t* topo,
-                                                         const ChronosRT_et_topology_config_t* cfg);
-ChronosRT_status_t       ChronosRT_et_topology_upsert(ChronosRT_et_topology_t* topo,
-                                                      const ChronosRT_et_node_info_t* info);
-ChronosRT_status_t       ChronosRT_et_topology_remove(ChronosRT_et_topology_t* topo,
-                                                      uint16_t node_id);
-const ChronosRT_et_node_info_t* ChronosRT_et_topology_find(const ChronosRT_et_topology_t* topo,
-                                                           uint16_t node_id);
-uint32_t                 ChronosRT_et_topology_count(const ChronosRT_et_topology_t* topo);
-const ChronosRT_et_node_info_t* ChronosRT_et_topology_at(const ChronosRT_et_topology_t* topo,
-                                                         uint32_t index);
-uint16_t                 ChronosRT_et_topology_next_free_slot(const ChronosRT_et_topology_t* topo);
-ChronosRT_status_t       ChronosRT_et_topology_assign_slot(ChronosRT_et_topology_t* topo,
-                                                           uint16_t node_id, uint16_t slot);
-ChronosRT_status_t       ChronosRT_et_topology_on_frame(ChronosRT_et_topology_t* topo,
-                                                        const uint8_t mac[6],
-                                                        const ChronosRT_et_header_t* h,
-                                                        uint64_t now_ns);
-bool                     ChronosRT_et_topology_needs_topo_check(const ChronosRT_et_topology_t* topo,
-                                                                uint16_t* out_node_id);
-uint32_t                 ChronosRT_et_topology_tick(ChronosRT_et_topology_t* topo,
-                                                    uint64_t now_ns, uint32_t cycle_ns);
-bool                     ChronosRT_et_topology_hot_connect_due(const ChronosRT_et_topology_t* topo,
-                                                               uint64_t frame_index,
-                                                               uint16_t* out_node_addr);
-uint32_t                 ChronosRT_et_topology_build_reply(const ChronosRT_et_node_info_t* info,
-                                                           uint8_t out[ChronosRT_ET_DISCOVERY_REPLY_SIZE]);
-ChronosRT_status_t       ChronosRT_et_topology_parse_reply(const uint8_t* in, uint32_t len,
-                                                           ChronosRT_et_node_info_t* out);
-```
-
-### 13.11 ET-MBX (mailbox de gestión)
-
-```c
-#define ChronosRT_ET_MBX_CHANNELS      8u
-#define ChronosRT_ET_MBX_SEGMENT_BYTES 512u
-#define ChronosRT_ET_MBX_MAX_RETRIES   3u
-#define ChronosRT_ET_MBX_ACK_SIZE      4u
-
-typedef enum {
-    ChronosRT_ET_MBX_IDLE = 0,
-    ChronosRT_ET_MBX_SENDING,
-    ChronosRT_ET_MBX_WAIT_ACK,
-    ChronosRT_ET_MBX_DONE,
-    ChronosRT_ET_MBX_FAILED
-} ChronosRT_et_mbx_state_t;
-
-typedef struct {
-    uint8_t  max_retries;
-    uint16_t segment_bytes;
-    uint8_t  p4_degrade_percent;   /* def. 70 */
-} ChronosRT_et_mbx_config_t;
-
-typedef struct {
-    ChronosRT_et_mbx_state_t state;
-    uint16_t seq, segment, total_segments;
-    uint8_t  retries;
-    bool     firmware;
-} ChronosRT_et_mbx_channel_status_t;
-
-ChronosRT_et_mbx_t* ChronosRT_et_mbx_create(void);
-void                ChronosRT_et_mbx_destroy(ChronosRT_et_mbx_t* mbx);
-void                ChronosRT_et_mbx_default_config(ChronosRT_et_mbx_config_t* cfg);
-ChronosRT_status_t  ChronosRT_et_mbx_configure(ChronosRT_et_mbx_t* mbx,
-                                               const ChronosRT_et_mbx_config_t* cfg);
-ChronosRT_status_t  ChronosRT_et_mbx_begin(ChronosRT_et_mbx_t* mbx, uint8_t channel,
-                                           uint32_t total_bytes, bool firmware);
-ChronosRT_status_t  ChronosRT_et_mbx_status(const ChronosRT_et_mbx_t* mbx, uint8_t channel,
-                                            ChronosRT_et_mbx_channel_status_t* out);
-ChronosRT_status_t  ChronosRT_et_mbx_next_segment(ChronosRT_et_mbx_t* mbx, uint8_t channel,
-                                                  const uint8_t* data, uint32_t len,
-                                                  uint8_t* out, uint32_t out_size,
-                                                  uint32_t* out_len);
-ChronosRT_status_t  ChronosRT_et_mbx_on_ack(ChronosRT_et_mbx_t* mbx, uint8_t channel,
-                                            uint16_t seq, bool accepted, uint64_t now_ns);
-bool                ChronosRT_et_mbx_retry_due(const ChronosRT_et_mbx_t* mbx, uint8_t channel,
-                                               uint64_t now_ns);
-uint8_t             ChronosRT_et_mbx_effective_priority(const ChronosRT_et_mbx_t* mbx,
-                                                        uint8_t p4_occupancy_percent);
-uint32_t            ChronosRT_et_mbx_build_ack(uint8_t channel, uint16_t seq, bool accepted,
-                                               uint8_t out[ChronosRT_ET_MBX_ACK_SIZE]);
-ChronosRT_status_t  ChronosRT_et_mbx_parse_ack(const uint8_t* in, uint32_t len,
-                                               uint8_t* channel, uint16_t* seq, bool* accepted);
-ChronosRT_status_t  ChronosRT_et_mbx_parse_data(const uint8_t* in, uint32_t len,
-                                                uint8_t* channel, uint16_t* seq,
-                                                uint16_t* index, uint16_t* total,
-                                                const uint8_t** data, uint16_t* data_len);
-```
-
-### 13.12 FRM (redundancia lógica de flujo)
-
-```c
-typedef struct {
-    uint64_t duplicates_tx, duplicates_rx, dropped_dup;
-    uint32_t path_switches;
-} ChronosRT_et_frm_stats_t;
-
-ChronosRT_et_frm_t* ChronosRT_et_frm_create(void);
-void                ChronosRT_et_frm_destroy(ChronosRT_et_frm_t* frm);
-void                ChronosRT_et_frm_reset(ChronosRT_et_frm_t* frm);
-bool                ChronosRT_et_frm_should_duplicate(const ChronosRT_et_frm_t* frm,
-                                                      uint8_t priority);
-uint8_t             ChronosRT_et_frm_alternate_flow(uint8_t flow_id);
-ChronosRT_status_t  ChronosRT_et_frm_note_rx(ChronosRT_et_frm_t* frm, uint16_t node_id,
-                                             uint32_t seq_num, bool duplicate_flag,
-                                             bool* out_is_new);
-ChronosRT_status_t  ChronosRT_et_frm_fail_path(ChronosRT_et_frm_t* frm, uint16_t node_id);
-uint8_t             ChronosRT_et_frm_active_path(const ChronosRT_et_frm_t* frm,
-                                                 uint16_t node_id);
-ChronosRT_status_t  ChronosRT_et_frm_stats(const ChronosRT_et_frm_t* frm,
-                                           ChronosRT_et_frm_stats_t* out);
-```
-
-Solo se duplican flujos P0/P1; el receptor deduplica por `(nodo, SeqNum)`.
-
-### 13.13 ID local determinista (MAC LAA)
-
-Esquema de dos niveles: el receptor deriva un ID de 16 bits de la MAC (filtro de
-recepción de coste constante) y el maestro es la autoridad que garantiza la
-unicidad.
-
-```c
-#define ChronosRT_ET_LOCAL_ID_MAX  0xFFFFu
-#define ChronosRT_ET_LOCAL_ID_NONE 0xFFFFu
-
-/* MAC local: 02:00:00:00:ID[15:8]:ID[7:0] (U/L=1, I/G=0) */
-uint32_t ChronosRT_et_aalid_mac(uint16_t id, uint8_t out[6]);
-uint16_t ChronosRT_et_aalid_id_from_mac(const uint8_t mac[6]);
-
-/* Nivel 1: ID candidato (sin ramas ni bucles) */
-uint16_t ChronosRT_et_aalid_candidate(const uint8_t mac[6]);      /* CRC-32C plegado */
-uint16_t ChronosRT_et_aalid_candidate_mul(const uint8_t mac[6]);  /* fallback portable */
-uint32_t ChronosRT_et_aalid_backoff_slots(const uint8_t mac[6], uint32_t slots);
-
-typedef enum {
-    ChronosRT_ET_AALID_OK = 0, ChronosRT_ET_AALID_COLLISION = 1,
-    ChronosRT_ET_AALID_DUPLICATE = 2, ChronosRT_ET_AALID_CLONE = 3,
-    ChronosRT_ET_AALID_FULL = 4, ChronosRT_ET_AALID_INVALID = 5
-} ChronosRT_et_aalid_result_t;
-
-typedef struct {
-    uint16_t id_max;        /* IDs asignables - 1 (def. 65535)          */
-    uint32_t grace_ms;      /* tiempo de gracia sin heartbeat (def. 600000) */
-    uint32_t table_slots;   /* potencia de 2 (def. 256; 0 => 256)       */
-} ChronosRT_et_aalid_config_t;
-
-typedef struct {
-    uint64_t admissions, collisions, duplicates;
-    uint64_t released, expired, clone_mac;
-    uint32_t occupied;
-} ChronosRT_et_aalid_stats_t;
-
-ChronosRT_et_aalid_t* ChronosRT_et_aalid_create(const ChronosRT_et_aalid_config_t* cfg);
-void                  ChronosRT_et_aalid_destroy(ChronosRT_et_aalid_t* aalid);
-void                  ChronosRT_et_aalid_default_config(ChronosRT_et_aalid_config_t* cfg);
-
-ChronosRT_status_t ChronosRT_et_aalid_admit(ChronosRT_et_aalid_t* aalid, const uint8_t mac[6],
-                                            uint32_t nonce, uint64_t now_ms, uint16_t* out_id,
-                                            ChronosRT_et_aalid_result_t* out_result);
-ChronosRT_status_t ChronosRT_et_aalid_release(ChronosRT_et_aalid_t* aalid, uint16_t id);
-ChronosRT_status_t ChronosRT_et_aalid_lookup(const ChronosRT_et_aalid_t* aalid,
-                                             const uint8_t mac[6], uint16_t* out_id);
-ChronosRT_status_t ChronosRT_et_aalid_heartbeat(ChronosRT_et_aalid_t* aalid, uint16_t id,
-                                                uint64_t now_ms);
-uint32_t           ChronosRT_et_aalid_expire(ChronosRT_et_aalid_t* aalid, uint64_t now_ms);
-ChronosRT_status_t ChronosRT_et_aalid_stats(const ChronosRT_et_aalid_t* aalid,
-                                            ChronosRT_et_aalid_stats_t* out);
-bool               ChronosRT_et_aalid_is_occupied(const ChronosRT_et_aalid_t* aalid, uint16_t id);
-ChronosRT_status_t ChronosRT_et_aalid_save(const ChronosRT_et_aalid_t* aalid, const char* path);
-ChronosRT_status_t ChronosRT_et_aalid_load(ChronosRT_et_aalid_t* aalid, const char* path);
-```
-
-`admit` devuelve `ChronosRT_SUCCESS` con el ID final (también en colisión y en
-duplicado), `ChronosRT_ERROR_STATE` si la MAC está clonada (misma MAC con
-distinto `nonce`) y `ChronosRT_ERROR_FULL` si no quedan IDs. La asignación es
-determinista: la misma secuencia de llegadas produce siempre el mismo resultado
-y el *backoff* se deriva de la MAC, nunca de `rand()`.
-
-`save`/`load` persisten `{MAC → ID}` con reemplazo atómico (`tmp` + `rename`)
-para conservar la identidad tras un reinicio del maestro.
-
-**Configuración y memoria.** `id_max` fija el rango de IDs (65 536 por
-defecto) y `table_slots` el número de nodos que caben en la tabla hash
-(256 por defecto; `create` lo redondea a potencia de 2 entre 16 y 65 536).
-Con los valores por defecto el módulo ocupa ≈ **14,4 KB** (tabla 256 × 24 B +
-bitmap de 8 KB). Para más de 256 nodos, aumente `table_slots`.
-
-**Estados internos.** Cada ranura está *libre*, *activa* o es un *tombstone*
-de una entrada liberada. El sondeo lineal continúa sobre los *tombstones*
-para no romper las cadenas y los reutiliza al insertar.
-
-**Persistencia.** Fichero con cabecera de 16 B (`ETID`, versión 1 y número de
-entradas) seguida de 24 B por entrada (MAC, ID, `nonce` y `last_hb_ms`).
-
-**Complejidad.** `admit` y `lookup` son O(1) amortizado/medio; `release` y
-`expire` recorren la tabla (O(slots)) y son operaciones administrativas fuera
-del superframe.
-
-### 13.14 Maestro EtherTux
-
-```c
-typedef struct {
-    uint16_t id;
-    uint8_t  mac[6];
-    int64_t  last_seen_ns;
-    int64_t  clock_offset_ns;
-    uint32_t rtt_ns;
-    uint32_t missed_cycles;
-    bool     lost;
-} ChronosRT_et_node_t;
-
-typedef struct {
-    uint64_t frames_tx, frames_rx, bytes_tx, bytes_rx;
-    uint64_t dropped, backpressure, fec_blocks, frame_errors;
-    uint64_t duplicates_tx, wkc_mismatches, sync_out_of_sync, mbx_retries;
-    uint64_t local_id_dropped;   /* descartadas por destino ajeno (ID local) */
-} ChronosRT_et_master_stats_t;
-```
-
-```c
-ChronosRT_et_master_t* ChronosRT_et_master_create(void);
-void                   ChronosRT_et_master_destroy(ChronosRT_et_master_t* master);
-
-ChronosRT_status_t ChronosRT_et_master_open(ChronosRT_et_master_t* master, const char* ifname);
-ChronosRT_status_t ChronosRT_et_master_open_ex(ChronosRT_et_master_t* master, const char* ifname,
-                                               uint64_t link_bps, uint32_t cycle_ns);
-ChronosRT_status_t ChronosRT_et_master_open_auto(ChronosRT_et_master_t* master,
-                                                 const char* ifname);
-void               ChronosRT_et_master_close(ChronosRT_et_master_t* master);
-bool               ChronosRT_et_master_is_open(const ChronosRT_et_master_t* master);
-const char*        ChronosRT_et_master_interface(const ChronosRT_et_master_t* master);
-uint64_t           ChronosRT_et_link_speed_bps(const char* ifname);
-
-ChronosRT_status_t ChronosRT_et_master_set_qos(ChronosRT_et_master_t* master,
-                                               const ChronosRT_et_qos_config_t* cfg);
-ChronosRT_status_t ChronosRT_et_master_set_fec(ChronosRT_et_master_t* master,
-                                               ChronosRT_et_fec_mode_t mode);
-ChronosRT_status_t ChronosRT_et_master_attach_scheduler(ChronosRT_et_master_t* master,
-                                                        ChronosRT_et_sched_t* sched);
-ChronosRT_status_t ChronosRT_et_master_attach_topology(ChronosRT_et_master_t* master,
-                                                       ChronosRT_et_topology_t* topo);
-ChronosRT_status_t ChronosRT_et_master_attach_sync(ChronosRT_et_master_t* master,
-                                                   ChronosRT_et_sync_t* sync);
-ChronosRT_status_t ChronosRT_et_master_attach_esm(ChronosRT_et_master_t* master,
-                                                  ChronosRT_et_esm_t* esm);
-ChronosRT_status_t ChronosRT_et_master_attach_mbx(ChronosRT_et_master_t* master,
-                                                  ChronosRT_et_mbx_t* mbx);
-ChronosRT_status_t ChronosRT_et_master_attach_frm(ChronosRT_et_master_t* master,
-                                                  ChronosRT_et_frm_t* frm);
-```
-
-Envío y recepción:
-
-```c
-ChronosRT_status_t ChronosRT_et_master_send(master, uint8_t priority,
-                                            ChronosRT_et_type_t type, uint8_t flow_id,
-                                            const void* payload, uint16_t len);
-ChronosRT_status_t ChronosRT_et_master_send_at(master, priority, type, flow_id,
-                                               payload, len, uint64_t tx_deadline_ns);
-ChronosRT_status_t ChronosRT_et_master_send_zerocopy(master, priority, type, flow_id,
-                                                     const void* payload, uint16_t len);
-ChronosRT_status_t ChronosRT_et_master_send_batch(master,
-                                                  const ChronosRT_et_batch_item_t* items,
-                                                  uint32_t count);
-ChronosRT_status_t ChronosRT_et_master_send_aggregated(master, priority, flow_id,
-                                                       const ChronosRT_et_flow_entry_t* entries,
-                                                       uint32_t count);
-ChronosRT_status_t ChronosRT_et_master_send_mailbox(master, uint8_t channel,
-                                                    const void* data, uint16_t len,
-                                                    uint8_t p4_occupancy_percent);
-ChronosRT_status_t ChronosRT_et_master_send_fec_block(master, priority, flow_id,
-                                                      const uint8_t* const* data,
-                                                      uint32_t count, uint32_t len);
-ChronosRT_status_t ChronosRT_et_master_send_to(master, uint16_t dest_id, uint8_t priority,
-                                               ChronosRT_et_type_t type, uint8_t flow_id,
-                                               const void* payload, uint16_t len);
-int                ChronosRT_et_master_recv(master, ChronosRT_et_header_t* hdr,
-                                            void* payload, uint32_t bufsize,
-                                            uint32_t timeout_us);
-```
-
-`send_batch` admite hasta 16 tramas en una sola llamada (`sendmmsg` o anillo TX).
-`send_to` usa la MAC LAA del nodo destino (unicast) en lugar de difusión.
-
-ID local en el maestro:
-
-```c
-ChronosRT_status_t ChronosRT_et_master_enable_local_ids(master,
-                                                        const ChronosRT_et_aalid_config_t* cfg);
-ChronosRT_status_t ChronosRT_et_master_set_local_id(master, uint16_t id);
-uint16_t           ChronosRT_et_master_local_id(const ChronosRT_et_master_t* master);
-ChronosRT_et_aalid_t* ChronosRT_et_master_aalid(master);
-ChronosRT_status_t ChronosRT_et_master_admit_node(master, const uint8_t mac[6],
-                                                  uint32_t nonce, uint64_t now_ms,
-                                                  uint16_t* out_id,
-                                                  ChronosRT_et_aalid_result_t* out_result);
-uint32_t           ChronosRT_et_master_expire_local_ids(master, uint64_t now_ms);
-bool               ChronosRT_et_master_accepts_destination(const master, const uint8_t mac[6]);
-```
-
-Con el ID local activo, la recepción descarta antes de parsear toda trama
-unicast dirigida a otro nodo (`local_id_dropped`) y los nodos se indexan por
-hash de MAC (1–2 comparaciones) en lugar de un barrido lineal.
-
-### 13.15 Modo de transmisión
-
-```c
-typedef enum {
-    ChronosRT_ET_TX_AUTO    = 0,   /* anillo TX si el kernel lo permite */
-    ChronosRT_ET_TX_SYSCALL = 1,   /* sendmsg / sendmmsg                 */
-    ChronosRT_ET_TX_RING    = 2    /* PACKET_TX_RING obligatorio         */
-} ChronosRT_et_tx_mode_t;
-
-ChronosRT_status_t ChronosRT_et_master_set_tx_mode(ChronosRT_et_master_t* master,
-                                                   ChronosRT_et_tx_mode_t mode);
-bool               ChronosRT_et_master_tx_ring_active(const ChronosRT_et_master_t* master);
-```
-
-Con `PACKET_TX_RING` la trama se escribe en una ranura mapeada en espacio de
-usuario y un único `send()` vacía el lote completo.
-
-### 13.16 Nodos, heartbeat y estadísticas
-
-```c
-uint16_t ChronosRT_et_master_last_wkc(const ChronosRT_et_master_t* master);
-uint32_t ChronosRT_et_master_heartbeat(ChronosRT_et_master_t* master, uint64_t now_ns);
-uint32_t ChronosRT_et_master_node_count(const ChronosRT_et_master_t* master);
-bool     ChronosRT_et_master_node(const ChronosRT_et_master_t* master, uint32_t index,
-                                  ChronosRT_et_node_t* out);
-ChronosRT_status_t ChronosRT_et_master_rtt_sync(ChronosRT_et_master_t* master,
-                                                const uint8_t mac[6], uint32_t rtt_ns);
-ChronosRT_status_t ChronosRT_et_master_stats(const ChronosRT_et_master_t* master,
-                                             ChronosRT_et_master_stats_t* out);
-void               ChronosRT_et_master_reset_stats(ChronosRT_et_master_t* master);
-```
+### 11.12 Propiedades de ingeniería
+
+- **Tiempo real:** buffers de trama, `IOMap` y estructuras de esclava se reservan una vez en
+  `create`/`config_map`; el camino caliente (`send_processdata`/`receive_processdata`) no asigna.
+- **Determinismo:** todos los *timeouts* se miden con `CLOCK_MONOTONIC`; `poll()` usa vencimiento
+  absoluto, de modo que no hay *busy-wait* ni esperas sin cota.
+- **Resiliencia:** validación de WKC por ciclo, marca `is_lost` por esclava, contadores de error del
+  ESC, ACK de errores AL, reintentos acotados y redundancia de doble NIC.
+- **Ultra rendimiento:** bit **M** para encadenar datagramas, `PACKET_QDISC_BYPASS` y prioridad de
+  socket, con cero copias innecesarias entre trama y IOMap.
+- **Degradación elegante:** cualquier operación sobre un maestro cerrado, una interfaz inexistente o
+  la ausencia de `CAP_NET_RAW` devuelve un código de error (`ChronosRT_ERROR_INVALID`,
+  `ChronosRT_ERROR_IO`, `ChronosRT_ERROR_NO_HARDWARE`) **sin provocar un *crash***.
+
+### 11.13 Diagnóstico
+
+`ChronosRT_ec_master_working_counter()` (WKC del último ciclo), `expected_wkc()`,
+`frames_sent()` y `frames_lost()` permiten al operador detectar degradación del enlace o esclavas
+caídas sin instrumentación externa.
 
 ---
 
-## 14. Integración con `libtuxrt_core` — `chronosrt_tuxrt.h`
+## 12. Librerías y Dependencias
 
-ChronosRT se publica como **proveedor** (`tuxrt_provider_descriptor`) y **no**
-enlaza contra `libtuxrt_core`; es el consumidor quien lo descubre con
-`dlopen`/`dlsym`.
+### 12.1 Librerías del Sistema Requeridas
 
-```c
-typedef int (*ChronosRT_event_sink_fn)(const ChronosRT_event_t* event, void* user);
+ChronosRT Master depende de las siguientes librerías del sistema para su funcionamiento óptimo:
 
-typedef struct {
-    ChronosRT_handle_t      handle;
-    ChronosRT_event_sink_fn sink;
-    void*                   user;
-    ChronosRT_counters_t    counters;
-    ChronosRT_trace_t       trace;
-    _Atomic bool            attached;
-} ChronosRT_bridge_t;
+| Librería | Versión Mínima | Propósito | Impacto en Rendimiento |
+|----------|----------------|-----------|------------------------|
+| `glibc` | 2.31 | Funciones base de C, `mmap`, `mbind`, `sched_*` | Crítico |
+| `libpthread` | 2.31 | Threading POSIX | Crítico |
+| `libm` | 2.31 | `sqrt`/estadística del benchmark | Bajo |
+| `libdl` | 2.31 | `dlopen` del puente con proveedores externos | Bajo |
 
-ChronosRT_status_t ChronosRT_bridge_attach(ChronosRT_bridge_t* bridge,
-                                           ChronosRT_handle_t handle,
-                                           ChronosRT_event_sink_fn sink, void* user);
-ChronosRT_status_t ChronosRT_bridge_detach(ChronosRT_bridge_t* bridge);
-uint64_t           ChronosRT_bridge_pump(ChronosRT_bridge_t* bridge,
-                                         uint32_t max_events, uint32_t timeout_us);
-const ChronosRT_counters_t* ChronosRT_bridge_counters(const ChronosRT_bridge_t* bridge);
-const char*        ChronosRT_tuxrt_namespace_info(void);
-```
+No se enlaza `libnuma` ni `libhugetlbfs`: NUMA y hugepages se implementan con
+`syscall(SYS_mbind)`, `mmap(MAP_HUGETLB)` y `madvise(MADV_HUGEPAGE)`, de modo que
+la biblioteca no añade dependencias opcionales.
+
+### 12.2 Dependencias de ejecución del maestro EtherCAT
+
+El maestro EtherCAT es **autónomo**: no enlaza SOEM, ni el maestro IgH, ni DPDK, ni *frameworks* de
+captura acelerada (`netmap`, `PF_RING`, `ONVM`). Sus únicas dependencias de ejecución son:
+
+| Dependencia | Tipo | Propósito |
+|---|---|---|
+| `glibc` (`AF_PACKET`, `poll`) | Sistema | Acceso a la NIC y temporización |
+| `CAP_NET_RAW` (o `root`) | Privilegio | Abrir el socket de paquetes EtherCAT |
+| Interfaz de red activa | Hardware | Medio físico (p. ej. `enp2s0`) |
+
+Esta decisión reduce la superficie de fallo y el consumo de CPU asociados a los *frameworks*
+externos, y mantiene el determinismo al no introducir hilos de sondeo ajenos al maestro.
+
+### 12.3 Coste de la ruta de red
+
+La ruta de red del maestro es un socket `AF_PACKET` con `PACKET_QDISC_BYPASS` y prioridad de socket
+elevada, sin copias intermedias entre la trama y el IOMap. EtherTux añade
+`PACKET_TX_RING` (ranuras mapeadas en espacio de usuario y un único `send()` por
+lote) y `SO_TXTIME` para *pacing* por hardware cuando la NIC lo soporta. No se
+emplea ninguna ruta de *bypass* del kernel (DPDK/AF_XDP): el objetivo es el
+**determinismo**, no el máximo *throughput* de propósito general.
 
 ---
 
-## 15. Ejemplo mínimo completo
+## 13. EtherTux y HAL de aceleración por hardware
+
+### 13.1 Visión general y selección de protocolo
+
+**EtherTux** es el tejido de comunicación determinista de ChronosRT para **Ethernet comercial**
+(NICs y switches estándar, SBC heterogéneas y MCUs con controlador Ethernet SPI/QSPI). Convive
+con el maestro EtherCAT; la elección es de **tiempo de configuración** y nunca simultánea sobre
+la misma interfaz.
+
+| Protocolo | Cuándo usarlo | Determinismo típico |
+|---|---|---|
+| **EtherCAT** (`0x88A4`) | Esclavas con ASIC/FPGA dedicado; ciclo < 100 µs | Jitter < 1 µs |
+| **EtherTux** (`0x88B5`) | NIC/switch comercial; SBC heterogéneas; MCU SPI/QSPI | Jitter < 1 µs (SBC con PHC); < 50 µs (MCU W6300) |
+
+La selección se resuelve con `chronosrt_protocol.h`:
 
 ```c
-#include <chronosrt/chronosrt.h>
-#include <chronosrt/chronosrt_kernel.h>
-#include <chronosrt/chronosrt_protocol.h>
+ChronosRT_protocol_t p = ChronosRT_protocol_from_env();   /* CHRONOSRT_PROTOCOL */
+/* o explícita: ChronosRT_protocol_from_string("ethertux") */
+```
+
+### 13.2 Formato de trama y CRC-32C
+
+Ethernet II + EtherType **0x88B5** + cabecera EtherTux de **26 bytes**:
+
+| Campo | Bytes | Descripción |
+|---|---|---|
+| `Type` | 1 | `0x01` Datos, `0x02` FEC, `0x03` Control, `0x04` Sync, `0x05` LAPM, `0x06` Discovery, `0x07` SyncCalibrated, `0x08` StateChange, `0x09` MailboxData, `0x0A` MailboxAck, `0x0B` SyncReport, `0x0C` TopoCheck |
+| `Priority` | 1 | Clase QoS P0–P5 |
+| `Flags` | 1 | bit0 FEC, bit1 preemptable, bit2 express, bit3 discovery, bit4 FRM |
+| `State` | 1 | Estado ET-ESM del emisor (`INIT/CONFIG/SAFE/OP/FAULT`) |
+| `FlowID` | 1 | 1–255 |
+| `SeqNum` | 4 | Secuencia por flujo |
+| `TxTimestamp` | 8 | ns del reloj monotónico |
+| `ET-WKC` | 2 | Working Counter: nodos que procesaron la trama |
+| `BlockID` | 2 | `(bloque << 8) \| índice dentro del bloque` |
+| `FlowCount` | 1 | Flujos agrupados (`1` = sin agregación) |
+| `CRC32` | 4 | CRC-32C de cabecera (con este campo a cero) + carga útil |
+| **Total** | **26** | |
+
+> **Corrección de erratum:** la especificación rotula la cabecera como "28 bytes",
+> pero la suma de sus campos es **26**. Se implementa la tabla, que es la fuente
+> de verdad (igual que se resolvió antes el erratum 20/22). El valor
+> `ChronosRT_ET_HEADER_SIZE` es **26**.
+
+**CRC-32C (Castagnoli) y no CRC-32 (IEEE)** porque es el único polinomio con aceleración por
+instrucción en **ambas** arquitecturas: `crc32cb/c/h/w/x` en ARMv8.1+ y `crc32` de SSE4.2 en
+x86-64. Así todos los nodos calculan el mismo valor con el menor coste posible.
+
+### 13.3 QoS jerárquico: token buckets, backpressure y LAPM
+
+| Nivel | Clase | Política | Al agotar su cuota |
+|---|---|---|---|
+| **P0** | Express | Ranura fija; preempción absoluta; trama 64 B | **Backpressure** (nunca se descarta) |
+| **P1** | Express | Ranura fija (sync, heartbeat, LAPM) | Degrada a **P2** |
+| **P2** | Time-triggered | Ventana dedicada (setpoints) | Degrada a **P4** |
+| **P3** | Rate-constrained | Token bucket (telemetría) | Degrada a **P4** |
+| **P4** | Rate-constrained | Token bucket menor (configuración) | Degrada a **P5** |
+| **P5** | Best-effort | Solo ventana BE (logs, firmware) | **Descartada** (drop-tail) |
+
+- **Reparto por defecto** para 1 Gbps sin sobre-suscripción: 5 + 5 + 50 + 30 + 20 + 15 = 125 MB/s.
+- **Backpressure consciente de prioridad**: si `occupancy(P0) > 80 %` se pausa la generación de
+  P2–P5; si `occupancy(P1) > 90 %`, se pausa P3–P5; si `occupancy(P2) > 95 %`, P4–P5.
+- **LAPM**: por encima del 80 % de ocupación de una clase sus flujos migran a la inferior; no
+  vuelven hasta bajar del 60 % (histéresis). La prioridad efectiva se propaga en el campo
+  `Priority` de la trama.
+
+API: `ChronosRT_et_qos_create/configure/admit/backpressure/effective_priority`.
+
+### 13.4 Planificador time-triggered
+
+Superframe de 1 ms dividido en cuatro ventanas (configurables, deben cubrir el ciclo):
+
+| Ventana | Duración | Prioridades |
+|---|---|---|
+| Control | 100 µs | P0, P1 |
+| Determinista | 200 µs | P2 |
+| Rate-constrained | 300 µs | P3, P4 |
+| Best-effort | 400 µs | P5 |
+
+P0 es **express**: puede transmitir en cualquier ventana. El resto solo en la suya. Si la NIC no
+soporta preempción por hardware, el planificador no encola tráfico de baja prioridad cuando hay
+una P0 pendiente, acotando el bloqueo al tiempo de transmisión de la trama en curso
+(`ChronosRT_et_tx_time_ns`, p. ej. 12,3 µs para 1518 B a 1 Gbps).
+
+Cuando un nodo cae, `ChronosRT_et_sched_remove_node()` libera sus ranuras.
+
+### 13.5 FEC Reed-Solomon sin retransmisión
+
+| Modo | Código | Overhead | Pérdidas recuperables |
+|---|---|---|---|
+| **Ligero** | RS(10,8) | 25 % | 2 por bloque |
+| **Robusto** | RS(16,8) | 100 % | 8 por bloque |
+
+Código **sistemático** sobre GF(2^8) (polinomio 0x11D) construido con matriz de Vandermonde
+(`G = Vtop⁻¹·V`). La codificación es una combinación lineal con coeficientes **constantes**, lo
+que permite vectorizar la multiplicación en GF(2^8) con tablas de nibble + `shuffle`. La
+decodificación es de **borrados** (se conoce qué paquetes faltan) por eliminación gaussiana: sin
+RTT y sin retransmisión.
+
+API: `ChronosRT_et_fec_create_mode`, `…_encode`, `…_decode`, y `ChronosRT_et_master_send_fec_block`
+(transmite K datos + N-K paridad con el `BlockID` correcto).
+
+### 13.6 HAL de aceleración (`chronosrt_hwaccel.h`)
+
+Sondeo en tiempo de ejecución, sin `#if` de compilación en el código de aplicación:
+
+| Capacidad | Detección | Fallback |
+|---|---|---|
+| CRC-32C | `HWCAP_CRC32` (ARMv8.1+) / `__builtin_cpu_supports("sse4.2")` | slice-by-8 |
+| FEC SIMD | NEON (obligatorio en AArch64) / AVX2 | escalar con tablas |
+| Crypto ARMv8 | `HWCAP_AES` | — (solo plano de gestión) |
+| PHC / Launch Time | `ETHTOOL_GET_TS_INFO` (`SOF_TIMESTAMPING_TX_HARDWARE`) | envío inmediato |
+
+```c
+const ChronosRT_hw_caps_t* caps = ChronosRT_hw_caps();
+/* Ejemplo en un AMD Zen2: crc32c_backend="sse4.2-x4", fec_backend="avx2" */
+```
+
+`ChronosRT_crc32c`, `ChronosRT_gf8_mul/inv`, `ChronosRT_rs_encode/decode` y
+`ChronosRT_tx_timestamp_ns` son la superficie pública de la HAL.
+
+Única SBC objetivo sin CRC32 por instrucción: **Banana Pi M2 Zero (Cortex-A7)**, que usa el
+fallback software sin perder funcionalidad.
+
+### 13.7 Arquitectura de módulos
+
+Organización del árbol (`src/` por subsistema; `include/chronosrt/` mantiene una superficie
+pública plana y estable):
+
+| Módulo | Responsabilidad |
+|---|---|
+| `src/protocols/ethertux/et_frame.c` | Serialización/parseo puro de la PDU y CRC-32C |
+| `src/protocols/ethertux/et_fec.c` | Bloques FEC sobre la HAL de Reed-Solomon |
+| `src/protocols/ethertux/et_qos.c` | Token buckets jerárquicos, backpressure y LAPM |
+| `src/protocols/ethertux/et_sched.c` | Planificador time-triggered y ranuras |
+| `src/protocols/ethertux/et_esm.c` | Máquina de estados ET-ESM del nodo |
+| `src/protocols/ethertux/et_sync.c` | ET-Sync y monitor de ventana de sincronización |
+| `src/protocols/ethertux/et_topology.c` | Registro de nodos, ET-WKC, descubrimiento y Hot Connect |
+| `src/protocols/ethertux/et_mbx.c` | Mailbox ET-MBX (8 canales, segmentos de 512 B) |
+| `src/protocols/ethertux/et_flowagg.c` | Flow Aggregator (`FlowCount > 1`) |
+| `src/protocols/ethertux/et_frm.c` | Redundancia lógica de flujo y deduplicación |
+| `src/protocols/ethertux/et_socket.c` | `AF_PACKET`/0x88B5, `SO_TXTIME`, `PACKET_TX_RING`, recepción con *deadline* |
+| `src/protocols/ethertux/et_master.c` | Ciclo de vida, envío/recepción, nodos y heartbeat |
+| `src/hwaccel/chronosrt_hwaccel.c` | CRC-32C HW, GF(2^8) y RS vectorizado |
+| `src/protocols/chronosrt_protocol.c` | Selección EtherCAT / EtherTux |
+
+### 13.8 Decisiones de implementación
+
+1. **Transporte `AF_PACKET`**, no AF_XDP: AF_XDP exige soporte del driver y libbpf, no está
+   disponible en todas las SBC objetivo y no puede validarse sin hardware. El datapath queda
+   aislado en `et_socket.c` para añadir un backend AF_XDP sin tocar el protocolo. Con
+   `PACKET_QDISC_BYPASS` + `SO_PRIORITY` + `SO_TXTIME` + `PACKET_TX_RING` se conservan las
+   propiedades críticas y se elimina la llamada al sistema por trama.
+2. **CRC-32C** (no CRC-32 IEEE) por aceleración universal, ver §13.2.
+3. **Cabecera de 26 B** (la tabla de la especificación suma 26; ver §13.2).
+4. **Decodificación de borrados** en lugar de corrección de errores: el receptor conoce qué
+   paquetes faltan; es más simple, determinista y suficiente para pérdidas de paquete.
+5. Los motores criptográficos del SoC **nunca** se usan en el camino crítico.
+
+### 13.9 Propiedades de ingeniería
+
+- **Tiempo real:** buffers de trama, `IOMap` y estructuras de esclava se reservan una vez en
+  `create`/`config_map`; el camino caliente (`send_processdata`/`receive_processdata`) no asigna.
+- **Determinismo:** todos los *timeouts* se miden con `CLOCK_MONOTONIC`; `poll()` usa vencimiento
+  absoluto, de modo que no hay *busy-wait* ni esperas sin cota.
+- **Resiliencia:** validación de WKC por ciclo, marca `is_lost` por esclava, contadores de error del
+  ESC, ACK de errores AL, reintentos acotados y redundancia de doble NIC.
+- **Ultra rendimiento:** bit **M** para encadenar datagramas, `PACKET_QDISC_BYPASS` y prioridad de
+  socket, con cero copias innecesarias entre trama y IOMap.
+- **Degradación elegante:** cualquier operación sobre un maestro cerrado, una interfaz inexistente o
+  la ausencia de `CAP_NET_RAW` devuelve un código de error (`ChronosRT_ERROR_INVALID`,
+  `ChronosRT_ERROR_IO`, `ChronosRT_ERROR_NO_HARDWARE`) **sin provocar un *crash***.
+
+### 13.10 Diagnóstico
+
+`ChronosRT_ec_master_working_counter()` (WKC del último ciclo), `expected_wkc()`,
+`frames_sent()` y `frames_lost()` permiten al operador detectar degradación del enlace o esclavas
+caídas sin instrumentación externa.
+
+### 13.11 Ejemplo de uso
+
+```c
 #include <chronosrt/chronosrt_ethertux.h>
 
-#include <stdio.h>
+ChronosRT_et_master_t* m = ChronosRT_et_master_create();
+if (ChronosRT_et_master_open_ex(m, "enp2s0", 1000000000ull, 1000000u) != ChronosRT_SUCCESS) {
+    /* sin CAP_NET_RAW o interfaz ausente: degradación elegante */
+}
+
+ChronosRT_et_master_set_fec(m, ChronosRT_ET_FEC_LIGHT);
+
+ChronosRT_et_sched_t* s = ChronosRT_et_sched_create(1000000u, 1000000000ull);
+ChronosRT_et_sched_add_slot(s, ChronosRT_ET_P2, 3u, 128u, 120000u);
+ChronosRT_et_master_attach_scheduler(m, s);
+
+uint8_t setpoint[16] = { 0 };
+ChronosRT_status_t st = ChronosRT_et_master_send(m, ChronosRT_ET_P2,
+                                                 ChronosRT_ET_TYPE_DATA, 1u,
+                                                 setpoint, sizeof(setpoint));
+if (st == ChronosRT_ERROR_BACKPRESSURE) {
+    /* el productor debe reducir la tasa: no se pierde la trama */
+}
+
+ChronosRT_et_header_t hdr;
+uint8_t payload[ChronosRT_ET_MAX_PAYLOAD];
+int n = ChronosRT_et_master_recv(m, &hdr, payload, sizeof(payload), 1000u);
+
+ChronosRT_et_master_destroy(m);   /* cierra el socket y libera QoS/FEC */
+ChronosRT_et_sched_destroy(s);
+```
+
+### 13.12 Diagnóstico avanzado
+
+| Métrica | Descripción | Umbral crítico |
+|---|---|---|
+| `frames_sent` | Tramas enviadas por segundo | -- |
+| `frames_lost` | Tramas perdidas detectadas | > 0 |
+| `WKC` | Working Counter esperado vs real | Discrepancia > 5% |
+| `DC Skew` | Diferencia de reloj DC | > ±100 µs |
+| `ESC Error` | Contador de errores ESC | > 0 |
+
+Herramientas de diagnóstico:
+
+```bash
+# Verificar WKC de los últimos ciclos
+echo 'WKC: $(ChronosRT_ec_master_working_counter(m))'
+
+# Contador de tramas perdidas
+echo 'Frames lost: $(ChronosRT_ec_master_frames_lost(m))'
+
+# Verificar DC Skew
+cat /sys/class/ptp/ptp0/time | head -1
+```
+
+### 13.13 Estadísticas detalladas del maestro
+
+Contadores por tipo de trama:
+
+| Tipo | Descripción | Uso típico |
+|---|---|---|
+| `ec_frames_tx` | Tramas EtherCAT enviadas | Monitorear throughput |
+| `ec_frames_rx` | Tramas EtherCAT recibidas | Verificar integridad |
+| `ec_datagrams_tx` | Datagramas transmitidos | Optimización de encadenamiento |
+| `ec_datagrams_rx` | Datagramas recibidos | Análisis de overhead |
+| `ec_processdata_rx` | PDO procesados | Ciclo de proceso estable |
+
+### 13.14 Multi-NIC, Balanceo de Carga y Circuit Breaker
+
+ChronosRT Master implementa soporte multi-NIC con algoritmos de balanceo de carga y
+circuit breaker integrados para alta disponibilidad y tolerancia a fallos.
+
+#### 13.14.1 Arquitectura multi-NIC
+
+```mermaid
+flowchart TB
+    subgraph SIRC["ARQUITECTURA MULTI-NIC"]
+        direction TB
+        S["SIRC<br/>(Master)"]
+        A["Adapter Array [N]"]
+
+        S <-->|"Health Check<br/>Update health"| A
+
+        LB["Load Selector<br/>(Round-Robin)"]
+        CB["Circuit Breaker<br/>(CLOSED / OPEN)"]
+
+        S --> LB
+        LB --> CB
+
+        subgraph NICS["NICs"]
+            direction LR
+            N1["Adapter [i]<br/>NIC/i (enp2s0)"]
+            N2["Adapter [j]<br/>NIC/j (enp3s0)"]
+        end
+
+        A --> NICS
+        CB --> NICS
+    end
+```
+
+#### 13.14.2 Algoritmos de balanceo de carga
+
+Los algoritmos están definidos en `tuxrt_load_balance_algo_t`:
+
+| Algoritmo | Valor | Descripción |
+|---|---|---|
+| `TUXRT_LOAD_BALANCE_ROUND_ROBIN` | 0 | Rotación cíclica equitativa entre NICs |
+| `TUXRT_LOAD_BALANCE_WEIGHTED` | 1 | Basado en salud y error rate del adaptador |
+| `TUXRT_LOAD_BALANCE_RATE_BASED` | 2 | Basado en bandwidth disponible por NIC |
+| `TUXRT_LOAD_BALANCE_ADAPTIVE` | 3 | Combina round-robin con health check dinámico |
+| `TUXRT_LOAD_BALANCE_LEAST_LATENCY` | 4 | Selecciona menor latency observada |
+| `TUXRT_LOAD_BALANCE_QPOLICY` | 5 | Quality-based: prioriza por QoS global |
+
+**Uso:**
+
+```c
+tuxrt_sirc_multi_nic_config_t cfg = {0};
+cfg.max_adapters = 4;
+cfg.load_balance_algo = TUXRT_LOAD_BALANCE_ADAPTIVE;
+cfg.enable_load_balancing = true;
+cfg.enable_failover = true;
+cfg.health_check_interval_ns = 1000000000ULL;  /* 1s */
+cfg.failure_threshold = 5;
+cfg.recovery_timeout_ms = 5000;
+
+tuxrt_sirc_t* sirc;
+tuxrt_sirc_create_multi(&cfg, 4, &sirc);
+```
+
+#### 13.14.3 Circuit Breaker y detección de fallos
+
+El circuit breaker protege contra cascadas de fallos. Los estados son:
+
+- **CLOSED (0)**: Funcionamiento normal, health check activo
+- **OPEN (1)**: Adaptador marcado como DOWN, failover activo
+- **HALF_OPEN (2)**: Prueba de recuperación, envío limitado
+
+```c
+typedef struct {
+    uint64_t last_success_ns;
+    uint64_t last_failure_ns;
+    uint64_t last_latency_ns;
+    uint64_t last_state_change_ns;
+    uint32_t consecutive_failures;
+    uint32_t consecutive_successes;
+    double   error_rate;
+    double   avg_latency_ns;
+    double   throughput_mbps;
+    uint32_t cb_state;  /* 0=CLOSED, 1=OPEN, 2=HALF_OPEN */
+    uint32_t packet_sent;
+    uint32_t packet_received;
+    uint32_t packet_dropped;
+    uint32_t seq_counter;
+} tuxrt_health_stats_t;
+```
+
+**Política de apertura:**
+- 5 fallos consecutivos con error_rate > 0.1 → OPEN
+- Tiempo de espera: `recovery_timeout_ms`
+- En HALF_OPEN: 1 envío de prueba, si éxito → CLOSED, si falla → OPEN
+
+#### 13.14.4 Prioridades multi-NIC (QoS global)
+
+```c
+typedef enum {
+    TUXRT_NIC_PRIORITY_CRITICAL = 0,  /* P0: emergency, ACK/NACK crítico */
+    TUXRT_NIC_PRIORITY_HIGH = 1,      /* P1: sync, heartbeat */
+    TUXRT_NIC_PRIORITY_NORMAL = 2,    /* P2: setpoints de control */
+    TUXRT_NIC_PRIORITY_LOW = 3,       /* P3: telemetría */
+    TUXRT_NIC_PRIORITY_BACKGROUND = 4 /* P4-P5: configuración, logs, bulk */
+} tuxrt_nic_priority_t;
+```
+
+#### 13.14.5 API principal multi-NIC
+
+```c
+/* Enviar a través del adaptador más óptimo (balanceo automático) */
+tuxrt_err_t tuxrt_sirc_send_multi(tuxrt_sirc_t* sirc,
+                                   const uint8_t* data, size_t len,
+                                   tuxrt_timestamp_ns_t deadline,
+                                   size_t* out_used_index);
+
+/* Enviar con prioridad explícita (para QoS global) */
+tuxrt_err_t tuxrt_sirc_send_multi_priority(tuxrt_sirc_t* sirc,
+                                            const uint8_t* data, size_t len,
+                                            tuxrt_nic_priority_t priority,
+                                            tuxrt_timestamp_ns_t deadline,
+                                            size_t* out_used_index);
+
+/* Recibir del adaptador activo con menor latencia */
+tuxrt_err_t tuxrt_sirc_recv_multi(tuxrt_sirc_t* sirc,
+                                  uint8_t* buf, size_t* len,
+                                  tuxrt_timestamp_ns_t deadline);
+
+/* Actualizar health de todos los adaptadores */
+void tuxrt_sirc_update_multi_health(tuxrt_sirc_t* sirc);
+
+/* Trigger failover manual */
+tuxrt_err_t tuxrt_sirc_trigger_failover(tuxrt_sirc_t* sirc, tuxrt_transport_type_t target);
+
+/* Failover a una interfaz específica */
+tuxrt_err_t tuxrt_sirc_failover_to_interface(tuxrt_sirc_t* sirc, const char* ifname);
+
+/* Estadísticas agregadas */
+tuxrt_err_t tuxrt_sirc_get_aggregate_stats(tuxrt_sirc_t* sirc,
+                                           tuxrt_multi_nic_aggregate_stats_t* out_stats);
+```
+
+#### 13.14.6 Fast Channel Switching (Warm Standby)
+
+Para failover ultra-rápido (< 100 µs):
+
+```c
+/* Pre-activar un adaptador para failover ultra-rápido (warm standby) */
+tuxrt_err_t tuxrt_sirc_prepare_failover(tuxrt_sirc_t* sirc, size_t index);
+
+/* Verificar si failover está listo */
+bool tuxrt_sirc_is_failover_ready(tuxrt_sirc_t* sirc, size_t index);
+```
+
+#### 13.14.7 Ejemplo completo multi-NIC
+
+```c
+#include <chronosrt/chronosrt_transport.h>
 
 int main(void) {
-    ChronosRT_kernel_info_t kinfo;
-    if (ChronosRT_kernel_probe(&kinfo) == ChronosRT_SUCCESS) {
-        ChronosRT_kernel_print(&kinfo);
+    /* Configuración multi-NIC con 2 interfaces EtherTux */
+    tuxrt_sirc_multi_nic_config_t cfg = {0};
+    cfg.max_adapters = 2;
+    cfg.load_balance_algo = TUXRT_LOAD_BALANCE_ADAPTIVE;
+    cfg.enable_load_balancing = true;
+    cfg.enable_failover = true;
+    cfg.health_check_interval_ns = 500000000ULL;  /* 500ms */
+    cfg.failure_threshold = 3;
+    cfg.recovery_timeout_ms = 2000;
+
+    tuxrt_sirc_t* sirc;
+    if (tuxrt_sirc_create_multi(&cfg, 2, &sirc) != TUXRT_OK) {
+        return -1;
     }
 
-    ChronosRT_config_t cfg = {0};
-    cfg.num_cpus        = 2;
-    cfg.event_pool_size = 65536;
-    cfg.lock_memory     = true;
-    cfg.use_deadline    = true;
-    cfg.use_timerfd     = true;
+    /* Registrar primera NIC */
+    tuxrt_transport_adapter_config_t cfg1 = {0};
+    cfg1.type = TUXRT_TRANSPORT_ETHERTUX;
+    cfg1.device_path = "enp2s0";
+    cfg1.enable_multi_nic = true;
+    tuxrt_sirc_register_ethertux(sirc, &cfg1);
 
-    ChronosRT_handle_t rt;
-    if (ChronosRT_init(&rt, &cfg) != ChronosRT_SUCCESS) {
-        return 1;
+    /* Registrar segunda NIC */
+    tuxrt_transport_adapter_config_t cfg2 = {0};
+    cfg2.type = TUXRT_TRANSPORT_ETHERTUX;
+    cfg2.device_path = "enp3s0";
+    cfg2.enable_multi_nic = true;
+    cfg2.priority = 1;  /* Menor prioridad */
+    tuxrt_sirc_register_ethertux(sirc, &cfg2);
+
+    /* Bucle principal con balanceo automático */
+    uint8_t buffer[256];
+    while (running) {
+        /* Enviar datos - balanceo automático por health/latency */
+        size_t used_idx;
+        tuxrt_sirc_send_multi_priority(sirc, data, len,
+                                       TUXRT_NIC_PRIORITY_NORMAL, 0, &used_idx);
+
+        /* Recibir respuesta */
+        size_t buf_len = sizeof(buffer);
+        tuxrt_sirc_recv_multi(sirc, buffer, &buf_len, 1000000);  /* 1ms timeout */
+
+        /* Monitorear health */
+        tuxrt_sirc_update_multi_health(sirc);
     }
 
-    if (ChronosRT_protocol_from_env() == ChronosRT_PROTOCOL_ETHERTUX) {
-        ChronosRT_et_master_t* et = ChronosRT_et_master_create();
-        if (et && ChronosRT_et_master_open(et, "enp2s0") == ChronosRT_SUCCESS) {
-            (void)ChronosRT_et_master_send(et, ChronosRT_ET_P1,
-                                           ChronosRT_ET_TYPE_DATA, 1u, "hola", 4u);
-        }
-        ChronosRT_et_master_destroy(et);
-    }
-
-    ChronosRT_metrics_t metrics;
-    (void)ChronosRT_benchmark_run(rt, ChronosRT_MODE_LATENCY, 10u, &metrics);
-    (void)ChronosRT_metrics_report(&metrics);
-
-    ChronosRT_shutdown(rt);
+    tuxrt_sirc_destroy_multi(sirc);
     return 0;
 }
 ```
 
-Compilación: `cc app.c -lchronosrt -lpthread -lm -ldl`.
+### 13.15 Verificación
+
+Estado global: **10 suites / 577 aserciones** (30 nuevas pruebas multi-NIC), build `Release` sin errores ni
+advertencias.
+
+Pruebas nuevas incluyen:
+- `tuxrt_sirc_create_multi`, `tuxrt_sirc_send_mult`, `tuxrt_sirc_recv_multi`
+- Algoritmos de balanceo: round-robin, weighted, rate-based, adaptive, least-latency, qpolicy
+- Circuit breaker: OPEN/CLOSED/HALF_OPEN state transitions
+- Failover manual y automático con warm standby
+- Estadísticas multi-NIC y agregadas
+
+Los tests cubren CRC-32C contra el
+vector estándar y contra el fallback software, álgebra de GF(2^8),
+codificación/decodificación RS con borrados (incluidos todos los datos perdidos),
+multi-NIC, balanceo de carga, circuit breaker, QoS (degradación, backpressure, LAPM con histéresis), ventanas del planificador,
+ciclo de vida del maestro, ET-ESM, ET-Sync y monitor de ventana, ET-WKC y
+topología, ET-MBX, Flow Aggregator, FRM y degradación elegante sin `CAP_NET_RAW`.
 
 ---
 
-## 16. Verificación de la API
+**Fin del Manual Técnico**
 
-Estado verificado en el host de referencia (Linux 7.2.11, GCC 16.2.1, CMake 4.4.4):
+---
 
-- Build `Release`: **0 errores, 0 warnings**.
-- `ctest`: **10/10 suites**, **547/547 aserciones**.
-- `libchronosrt.so` exporta **320 símbolos `ChronosRT_*`** con visibilidad
-  controlada.
-- HAL detectada: `crc32c_backend = "sse4.2-x4"`, `fec_backend = "avx2"`.
+## Apéndice A: Referencia Completa de la API
 
-La referencia ampliada del maestro EtherCAT está en el
-[Manual Técnico §11](MANUAL_TECNICO.md) y la de EtherTux en
-[Manual Técnico §13](MANUAL_TECNICO.md).
+### A.1 Estructuras de Datos Principales
+
+#### ChronosRT_event_t (64 bytes - Cache Line Aligned)
+
+```c
+typedef struct ChronosRT_CACHE_ALIGNED {
+    volatile uint64_t sequence;       // Offset 0-7:   Número de secuencia atómico
+    volatile uint64_t timestamp_ns;   // Offset 8-15:  Timestamp nanosegundos creación
+    volatile uint32_t cpu_id;         // Offset 16-19: CPU que originó el evento
+    volatile uint8_t  data[56];       // Offset 20-63: Payload de datos (56 bytes)
+} ChronosRT_event_t;
+```
+
+**Consideraciones de diseño:**
+- Tamaño exacto de 64 bytes para alineación con cache line
+- Campos volátiles para garantizar visibilidad entre threads
+- Sin padding implícito - estructura compacta optimizada
+
+#### ChronosRT_config_t
+
+```c
+typedef struct {
+    uint32_t enabled_cpus[ChronosRT_MAX_CPUS];  // CPUs habilitadas (máx 16)
+    uint32_t num_cpus;          // Número de CPUs activas
+    uint32_t event_pool_size;   // Tamaño pool eventos (default: 65536)
+    uint32_t batch_size;        // Tamaño de batch procesamiento (default: 256)
+    uint32_t stack_size_kb;     // Stack por thread KB (default: 256)
+    bool     use_hugepages;     // Usar hugepages de 2MB
+    bool     use_numa_aware;    // Asignación NUMA-aware
+    bool     use_simd;          // Optimizaciones SIMD (AVX/NEON)
+    bool     use_cpu_affinity;  // Fijar threads a CPUs específicas
+    ChronosRT_platform_t platform;  // Plataforma detectada
+
+    /* Extensiones ABI v1 (F2–F7) */
+    bool     lock_memory;          // mlockall + prefault
+    bool     use_hugepages_2mb;    // MADV_HUGEPAGE en el pool
+    bool     strict_isolation;     // exigir isolcpus/nohz_full/rcu_nocbs
+    bool     use_deadline;         // SCHED_DEADLINE para hilos RT
+    bool     use_bounded_mpmc;     // cola bounded Vyukov
+    bool     use_timerfd;          // tick por timerfd en vez de usleep
+    uint32_t rt_priority;          // prioridad SCHED_FIFO (0 = auto)
+    uint64_t deadline_runtime_ns;  // presupuesto de ejecución
+    uint64_t deadline_period_ns;   // periodo
+} ChronosRT_config_t;
+```
+
+#### ChronosRT_metrics_t
+
+```c
+typedef struct ChronosRT_CACHE_ALIGNED {
+    uint64_t total_events;           // Eventos totales procesados
+    uint64_t total_cycles;           // Ciclos de CPU totales
+    uint64_t min_latency_ns;         // Latencia mínima observada
+    uint64_t max_latency_ns;         // Latencia máxima observada
+    uint64_t avg_latency_ns;         // Latencia promedio aritmético
+    uint64_t stddev_ns;              // Desviación estándar (jitter)
+    double   cpu_usage_percent;      // Porcentaje uso CPU
+    double   cache_miss_rate;        // Tasa de fallos de caché
+    double   branch_miss_rate;       // Tasa de fallos de predicción ramas
+    uint64_t memory_bandwidth_mbps;  // Ancho de banda memoria MB/s
+    uint64_t wcet_ns;                // Worst-Case Execution Time
+    uint64_t best_case_ns;           // Best-Case Execution Time
+    uint64_t p50_ns;                 // Percentil 50 (0 si el modo no lo calcula)
+    uint64_t p99_ns;                 // Percentil 99
+    uint64_t p999_ns;                // Percentil 99,9
+    uint64_t latency_spikes;         // Muestras > CHRONOSRT_LATENCY_TARGET_NS
+} ChronosRT_metrics_t;
+```
+
+### A.2 Funciones de Inicialización
+
+#### ChronosRT_init()
+
+```c
+ChronosRT_status_t ChronosRT_init(
+    ChronosRT_handle_t* handle,      // [out] Handle del sistema
+    const ChronosRT_config_t* config // [in]  Configuración
+);
+```
+
+**Retornos:**
+- `ChronosRT_SUCCESS (0)`: Inicialización exitosa
+- `ChronosRT_ERROR_INIT (-1)`: Fallo en inicialización
+- `ChronosRT_ERROR_MEMORY (-2)`: No hay memoria disponible
+- `ChronosRT_ERROR_CPU (-3)`: Error configuración CPU
+- `ChronosRT_ERROR_INVALID (-5)`: Parámetros inválidos
+
+**Proceso de inicialización:**
+1. Validación de parámetros de entrada
+2. Asignación de estructura core (`calloc`)
+3. Copia de configuración del usuario
+4. Aplicación de valores por defecto si corresponde
+5. Inicialización de Ring Buffer SPSC
+6. Inicialización de Cola MPMC (Michael-Scott)
+7. Cálculo de offset para ciclo contador
+8. Detección y configuración de afinidad CPU
+9. Creación de worker threads
+10. Retorno del handle al usuario
+
+**Ejemplo de uso:**
+
+```c
+ChronosRT_config_t config = {0};
+config.event_pool_size = 131072;  // 128K eventos
+config.use_simd = true;            // Activar AVX/NEON
+config.use_hugepages = true;       // Hugepages para TLB
+config.use_cpu_affinity = true;    // Fijar a CPUs 2,3
+config.enabled_cpus[0] = 2;
+config.enabled_cpus[1] = 3;
+config.num_cpus = 2;
+
+ChronosRT_handle_t handle;
+ChronosRT_status_t status = ChronosRT_init(&handle, &config);
+if (status != ChronosRT_SUCCESS) {
+    fprintf(stderr, "Init failed: %d\n", status);
+    exit(1);
+}
+```
+
+#### ChronosRT_shutdown()
+
+```c
+ChronosRT_status_t ChronosRT_shutdown(
+    ChronosRT_handle_t handle  // [in] Handle del sistema
+);
+```
+
+**Proceso de shutdown:**
+1. Setear flag `running = false` para notificar threads
+2. Esperar terminación de worker threads (`pthread_join`)
+3. Destruir cola MPMC y liberar nodos
+4. Liberar ring buffer
+5. Liberar estructura core
+
+### A.3 Funciones de Publicación/Suscripción
+
+#### ChronosRT_event_publish()
+
+```c
+ChronosRT_status_t ChronosRT_event_publish(
+    ChronosRT_handle_t handle,  // [in] Handle del sistema
+    const void* data,                  // [in] Puntero a datos
+    uint32_t size                      // [in] Tamaño en bytes
+);
+```
+
+**Algoritmo:**
+1. Validar handle y puntero de datos
+2. Asignar evento (`malloc` - 64 bytes)
+3. Capturar timestamp actual en nanosegundos
+4. Obtener ID de CPU actual (`sched_getcpu()`)
+5. Copiar datos usando SIMD si está habilitado
+6. Intentar push al Ring Buffer SPSC (fast path)
+7. Si falla, intentar push a Cola MPMC (slow path)
+8. Si ambos fallan, liberar evento y retornar error
+
+**Complejidad:** O(1) amortizado
+
+**Ejemplo:**
+
+```c
+typedef struct {
+    uint32_t command;
+    float position[3];
+    uint16_t velocity;
+} motion_command_t;
+
+motion_command_t cmd = {
+    .command = 0x01,
+    .position = {100.0f, 200.0f, 300.0f},
+    .velocity = 1500
+};
+
+ChronosRT_status_t ret = ChronosRT_event_publish(
+    handle, 
+    &cmd, 
+    sizeof(cmd)
+);
+```
+
+#### ChronosRT_event_subscribe()
+
+```c
+ChronosRT_status_t ChronosRT_event_subscribe(
+    ChronosRT_handle_t handle,  // [in] Handle del sistema
+    ChronosRT_event_t* event,   // [out] Evento recibido
+    uint32_t timeout_us                // [in] Timeout microsegundos
+);
+```
+
+**Algoritmo:**
+1. Validar handle y puntero de evento
+2. Intentar pop del Ring Buffer SPSC (fast path)
+3. Si está vacío, intentar pop de Cola MPMC (slow path)
+4. Si ambos están vacíos:
+   - Sleep por `timeout_us` microsegundos
+   - Retornar `ChronosRT_ERROR_TIMEOUT`
+5. Copiar evento al buffer del usuario
+6. Liberar evento original
+7. Retornar éxito
+
+### A.4 Funciones de Benchmarking
+
+#### ChronosRT_benchmark_run()
+
+```c
+ChronosRT_status_t ChronosRT_benchmark_run(
+    ChronosRT_handle_t handle,        // [in] Handle
+    ChronosRT_benchmark_mode_t mode,  // [in] Modo
+    uint32_t duration_sec,            // [in] Duración segundos
+    ChronosRT_metrics_t* metrics      // [out] Métricas
+);
+```
+
+**Modos disponibles:**
+
+| Modo | Descripción | Threads | Métricas principales |
+|------|-------------|---------|---------------------|
+| `ChronosRT_MODE_LATENCY` | Medición latencia round-trip | 1 | min/max/avg/stddev |
+| `ChronosRT_MODE_THROUGHPUT` | Máximo throughput | 4 | events/sec |
+| `ChronosRT_MODE_JITTER` | Análisis jitter | 1 | stddev, percentiles |
+| `ChronosRT_MODE_STRESS` | Prueba estrés CPU | 4 | CPU load, thermal |
+| `ChronosRT_MODE_WCET` | Worst-case execution | 1 | WCET medido |
+
+**Hilos de benchmark:**
+
+1. **bench_latency_thread**:
+   - Publica evento y mide tiempo hasta recepción
+   - Calcula estadísticas en tiempo real
+   - Usa afinidad CPU automática
+
+2. **bench_throughput_thread**:
+   - Publica ráfagas de 1000 eventos
+   - Cuenta total eventos por segundo
+   - Múltiples threads concurrentes
+
+3. **bench_stress_thread**:
+   - Ejecuta carga computacional intensiva
+   - Prioridad SCHED_FIFO máxima
+   - Evalúa estabilidad térmica
+
+#### ChronosRT_metrics_report()
+
+```c
+ChronosRT_status_t ChronosRT_metrics_report(
+    const ChronosRT_metrics_t* metrics  // [in] Métricas
+);
+```
+
+**Salida formateada (ejemplo real en kernel RT con núcleos aislados):**
+
+```text
+=== ChronosRT Benchmark Results ===
+Total Events:        471934674
+WCET (ns):           31999
+Best Case (ns):      80
+Min Latency (ns):    80
+Max Latency (ns):    31999
+Avg Latency (ns):    90
+StdDev (ns):         63
+p50 (ns):            100
+p99 (ns):            200
+p99.9 (ns):          200
+Spikes > 10 us:      3721 (7.885 ppm)
+CPU Usage (%):       0.00
+Cache Miss Rate:     0.0000%
+Branch Miss Rate:    0.0000%
+================================
+
+Status: NEEDS OPTIMIZATION - WCET > 10 μs
+```
+
+Los valores dependen del host. Los percentiles y `latency_spikes` solo aparecen
+en los modos que miden latencia (`latency`, `jitter`, `wcet`); el histograma
+interno tiene 64 buckets de 100 ns, por lo que los percentiles se resuelven hasta
+6,4 µs y la cola se cuantifica con `latency_spikes` (muestras > 10 µs en ppm).
+
+**Criterios de estado (el WCET tiene prioridad):**
+- WCET > 10 µs → `NEEDS OPTIMIZATION - WCET > 10 μs`
+- sin métricas de latencia → `OK - modo sin métricas de latencia`
+- `EXCELLENT`: stddev < 1000 ns (1 μs)
+- `GOOD`: stddev < 5000 ns (5 μs)
+- `NEEDS OPTIMIZATION`: stddev >= 5000 ns
+
+### A.5 Funciones Utilitarias
+
+#### ChronosRT_get_timestamp_ns()
+
+```c
+uint64_t ChronosRT_get_timestamp_ns(void);
+```
+
+**Implementación por arquitectura:**
+
+**x86_64:**
+```c
+// Usa clock_gettime(CLOCK_MONOTONIC)
+// Resolución típica: 1 ns
+```
+
+**ARM64:**
+```c
+// Usa clock_gettime(CLOCK_MONOTONIC)
+// Resolución típica: 1 ns
+```
+
+**Retorno:** Timestamp en nanosegundos desde epoch monotónico
+
+#### ChronosRT_get_cycles()
+
+```c
+uint64_t ChronosRT_get_cycles(void);
+```
+
+**Implementación por arquitectura:**
+
+**x86_64 (RDTSC):**
+```asm
+rdtsc                    ; Leer contador de ciclos
+; Resultado en EDX:EAX
+```
+
+**ARM64 (PMCCNTR_EL0):**
+```asm
+mrs x0, pmccntr_el0      ; Leer registro de performance counter
+```
+
+**Genérico (fallback):**
+```c
+clock_gettime(CLOCK_MONOTONIC, &ts);
+return ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+```
+
+#### ChronosRT_detect_platform()
+
+```c
+ChronosRT_platform_t ChronosRT_detect_platform(void);
+```
+
+**Método de detección:**
+1. Leer `/proc/cpuinfo`
+2. Buscar strings identificadores:
+   - "Raspberry Pi" → RPI4/RPI5
+   - "Jetson" → JETSON_NANO/JETSON_ORIN
+   - "Rockchip RK3588" → ROCK5B/ORANGE_PI5
+3. Para x86_64 → INTEL_NUC o X86_64_RT
+4. Default → PLATFORM_GENERIC
+
+---
+
+## Apéndice B: Especificaciones de Plataformas
+
+### B.1 Raspberry Pi 4
+
+| Característica | Valor |
+|----------------|-------|
+| **SoC** | Broadcom BCM2711 |
+| **CPU** | Quad-core Cortex-A72 @ 1.5 GHz |
+| **L1 Cache** | 32 KB (I+D) por core |
+| **L2 Cache** | 512 KB compartido |
+| **L3 Cache** | No disponible |
+| **RAM** | 2/4/8 GB LPDDR4 |
+| **SIMD** | NEON (ARMv8-A) |
+| **Red** | Gigabit Ethernet |
+| **Uso recomendado** | Desarrollo, prototipos |
+
+**Configuración óptima:**
+
+```ini
+[performance]
+event_pool_size = 32768
+batch_size = 128
+use_simd = true
+use_hugepages = false
+
+[cpu]
+use_cpu_affinity = true
+enabled_cpus = 2,3
+```
+
+### B.2 Raspberry Pi 5
+
+| Característica | Valor |
+|----------------|-------|
+| **SoC** | Broadcom BCM2712 |
+| **CPU** | Quad-core Cortex-A76 @ 2.0 GHz |
+| **L1 Cache** | 32 KB (I+D) por core |
+| **L2 Cache** | 1 MB compartido |
+| **L3 Cache** | 2 MB compartido |
+| **RAM** | 4/8 GB LPDDR4X |
+| **SIMD** | NEON (ARMv8.2-A) |
+| **Red** | Gigabit Ethernet PoE+ |
+| **Uso recomendado** | Producción embebida |
+
+**Mejoras vs RPi4:**
+- 33% más frecuencia CPU
+- 2x L2 cache
+- L3 cache añadido
+- Mejor ancho de banda memoria
+
+### B.3 NVIDIA Jetson Orin
+
+| Característica | Valor |
+|----------------|-------|
+| **SoC** | NVIDIA AGX Orin |
+| **CPU** | 12-core Cortex-A78AE @ 2.2 GHz |
+| **L1 Cache** | 64 KB (I+D) por core |
+| **L2 Cache** | 2 MB por cluster |
+| **L3 Cache** | 4 MB compartido |
+| **RAM** | 8/16/32/64 GB LPDDR5 |
+| **SIMD** | NEON + SVE (Scalable Vector Extension) |
+| **GPU** | 2048-core Ampere CUDA |
+| **Red** | 10 GbE opcional |
+| **Uso recomendado** | AI/ML edge computing |
+
+**Configuración óptima:**
+
+```ini
+[performance]
+event_pool_size = 262144
+batch_size = 512
+use_simd = true
+use_hugepages = true
+
+[cpu]
+use_cpu_affinity = true
+enabled_cpus = 8,9,10,11  # Cluster grande
+```
+
+### B.4 Intel NUC (12ma Gen)
+
+| Característica | Valor |
+|----------------|-------|
+| **CPU** | Intel Core i7-1260P |
+| **Arquitectura** | Alder Lake (hybrid) |
+| **P-cores** | 4x Performance @ 3.5 GHz |
+| **E-cores** | 8x Efficient @ 2.5 GHz |
+| **L1 Cache** | 48 KB I + 32 KB D (P-core) |
+| **L2 Cache** | 768 KB por P-core |
+| **L3 Cache** | 18 MB compartido |
+| **RAM** | Hasta 64 GB DDR4/DDR5 |
+| **SIMD** | SSE4.2, AVX2, AVX-512 |
+| **Red** | 2.5 GbE |
+| **Uso recomendado** | Industrial PC, gateway |
+
+**Instrucciones SIMD disponibles:**
+- AVX-512F: Operaciones vectoriales 512-bit
+- AVX-512DQ: Operaciones doubleword/quadword
+- AVX-512BW: Operaciones byte/word
+- AVX2: 256-bit integer/floating-point
+
+### B.5 Rockchip RK3588 (Orange Pi 5 / ROCK 5B)
+
+| Característica | Valor |
+|----------------|-------|
+| **CPU** | Octa-core (4xA76 + 4xA55) |
+| **Frecuencia** | 2.4 GHz (big), 1.8 GHz (LITTLE) |
+| **L1 Cache** | 32 KB por core |
+| **L2 Cache** | 512 KB por cluster |
+| **L3 Cache** | 3 MB compartido |
+| **RAM** | 4/8/16/32 GB LPDDR4/LPDDR4X |
+| **SIMD** | NEON (ARMv8.2-A) |
+| **NPU** | 6 TOPS INT8 |
+| **Red** | 2.5 GbE |
+| **Uso recomendado** | Edge AI, multimedia |
+
+---
+
+## Apéndice C: Guía de Optimización Avanzada
+
+### C.1 Optimización de Cache
+
+#### Evitar False Sharing
+
+**Problema:** Dos threads modifican variables en la misma cache line.
+
+**Solución:** Alinear estructuras a 64 bytes:
+
+```c
+#define ChronosRT_CACHE_LINE 64
+#define ChronosRT_CACHE_ALIGNED __attribute__((aligned(ChronosRT_CACHE_LINE)))
+
+typedef struct ChronosRT_CACHE_ALIGNED {
+    volatile uint64_t counter;  // 8 bytes
+    // 56 bytes de padding automático
+} atomic_counter_t;
+```
+
+#### Prefetching de Datos
+
+```c
+void process_batch(event_t* events, int count) {
+    for (int i = 0; i < count; i++) {
+        process_event(&events[i]);
+        
+        // Prefetch siguiente evento (lectura, temporalidad alta)
+        if (i + 1 < count) {
+            __builtin_prefetch(&events[i + 1], 0, 3);
+        }
+        
+        // Prefetch datos del evento actual
+        if (events[i].data_ptr) {
+            __builtin_prefetch(events[i].data_ptr, 0, 0);
+        }
+    }
+}
+```
+
+**Parámetros de `__builtin_prefetch`:**
+- `addr`: Dirección a prefetchear
+- `rw`: 0=read, 1=write
+- `locality`: 0=no temporal, 3=high temporal
+
+### C.2 Optimización de Memoria
+
+#### Uso de Hugepages
+
+**Beneficios:**
+- Reduce TLB misses significativamente
+- Mejora rendimiento en acceso a memoria grande
+- Disminuye overhead de page table walks
+
+**Configuración del sistema:**
+
+```bash
+# Verificar hugepages disponibles
+cat /proc/meminfo | grep Huge
+
+# Asignar 64 hugepages de 2MB (128 MB total)
+sudo sysctl -w vm.nr_hugepages=64
+
+# Hacer permanente
+echo "vm.nr_hugepages=64" >> /etc/sysctl.conf
+
+# Verificar
+grep Huge /proc/meminfo
+```
+
+**En ChronosRT Master:**
+
+```c
+config.use_hugepages = true;
+```
+
+#### Allocación NUMA-Aware
+
+Para sistemas multi-socket:
+
+```c
+#include <numa.h>
+
+// Asignar memoria del nodo local a la CPU
+int node = numa_node_of_cpu(sched_getcpu());
+void* ptr = numa_alloc_onnode(size, node);
+```
+
+### C.3 Optimización de CPU
+
+#### Aislamiento de CPUs
+
+**Kernel boot parameters:**
+
+```bash
+# Editar /etc/default/grub
+GRUB_CMDLINE_LINUX="isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3"
+
+# Actualizar GRUB
+sudo update-grub
+sudo reboot
+```
+
+**Explicación:**
+- `isolcpus=2,3`: Aislar CPUs 2 y 3 del scheduler
+- `nohz_full=2,3`: Desactivar tick scheduler en esas CPUs
+- `rcu_nocbs=2,3`: Mover callbacks RCU a otras CPUs
+
+#### Afinidad de Threads
+
+```c
+cpu_set_t cpuset;
+CPU_ZERO(&cpuset);
+CPU_SET(2, &cpuset);  // Fijar a CPU 2
+CPU_SET(3, &cpuset);  // y CPU 3
+
+pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+```
+
+#### Prioridades de Scheduling
+
+```c
+struct sched_param param;
+param.sched_priority = sched_get_priority_max(SCHED_FIFO);
+pthread_setschedparam(thread, SCHED_FIFO, &param);
+```
+
+**Políticas disponibles:**
+- `SCHED_FIFO`: FIFO real-time (prioridad fija)
+- `SCHED_RR`: Round-robin real-time
+- `SCHED_OTHER`: Time-sharing (default)
+
+### C.4 Optimización SIMD
+
+#### AVX-512 (x86_64)
+
+```c
+#include <immintrin.h>
+
+// Copia de 64 bytes usando AVX-512
+void simd_copy_64(void* dst, const void* src) {
+    __m512i v = _mm512_loadu_si512((const __m512i*)src);
+    _mm512_storeu_si512((__m512i*)dst, v);
+}
+
+// Zero-fill de 64 bytes
+void simd_zero_64(void* ptr) {
+    _mm512_storeu_si512((__m512i*)ptr, _mm512_setzero_si512());
+}
+```
+
+#### NEON (ARM64)
+
+```c
+#include <arm_neon.h>
+
+// Copia de 32 bytes usando NEON
+void neon_copy_32(void* dst, const void* src) {
+    uint64x2_t v0 = vld1q_u64((const uint64_t*)src);
+    uint64x2_t v1 = vld1q_u64((const uint64_t*)(src + 16));
+    vst1q_u64((uint64_t*)dst, v0);
+    vst1q_u64((uint64_t*)(dst + 16), v1);
+}
+```
+
+---
+
+## Apéndice D: Troubleshooting Avanzado
+
+### D.1 Debugging con GDB
+
+**Compilación con debug symbols:**
+
+```bash
+cmake .. -DCMAKE_BUILD_TYPE=Debug
+make
+```
+
+**Sesión de debugging:**
+
+```bash
+gdb ./build/chronosrt_bench
+
+(gdb) break ChronosRT_event_publish
+(gdb) break ChronosRT_ring_push
+(gdb) run --mode=latency --duration=5
+
+# Al llegar al breakpoint
+(gdb) bt full              # Backtrace completo
+(gdb) p *event             # Examinar evento
+(gdb) p *ring              # Examinar ring buffer
+(gdb) info registers       # Registros CPU
+(gdb) stepi                # Step instrucción por instrucción
+```
+
+### D.2 Análisis con perf
+
+**Perfilado básico:**
+
+```bash
+perf stat -e cycles,instructions,cache-references,cache-misses \
+    ./build/chronosrt_bench --mode=latency --duration=30
+```
+
+**Salida típica:**
+
+```text
+Performance counter stats for './build/chronosrt_bench':
+    45,234,567,890      cycles
+    89,123,456,789      instructions              # 1.97 insn per cycle
+     1,234,567,890      cache-references
+            12,345,678  cache-misses              # 1.00 % of all cache refs
+```
+
+**Flame graph:**
+
+```bash
+# Grabar
+perf record -F 99 -g ./build/chronosrt_bench --mode=throughput --duration=60
+
+# Generar flame graph
+perf script | stackcollapse-perf.pl | flamegraph.pl > flame.svg
+```
+
+### D.3 Análisis de Memory Leaks
+
+**Con Valgrind:**
+
+```bash
+valgrind --leak-check=full --show-leak-kinds=all \
+    --track-origins=yes ./build/chronosrt_test
+```
+
+**Salida:**
+
+```text
+==12345== LEAK SUMMARY:
+==12345==    definitely lost: 0 bytes in 0 blocks
+==12345==    indirectly lost: 0 bytes in 0 blocks
+==12345==      possibly lost: 0 bytes in 0 blocks
+==12345==    still reachable: 0 bytes in 0 blocks
+```
+
+### D.4 Diagnóstico de Problemas de Rendimiento
+
+**Checklist:**
+
+1. **Verificar PREEMPT_RT:**
+
+```bash
+zcat /proc/config.gz | grep PREEMPT_RT
+# Debe mostrar: CONFIG_PREEMPT_RT=y
+```
+
+2. **Verificar aislamiento CPU:**
+
+```bash
+cat /proc/cmdline | grep isolcpus
+cat /proc/interrupts | grep -v "CPU"
+```
+
+3. **Verificar hugepages:**
+
+```bash
+cat /proc/meminfo | grep Huge
+# HugePages_Total: 64
+# HugePages_Free: 64
+```
+
+4. **Verificar governor de CPU:**
+
+```bash
+cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+# Debe ser: performance
+```
+
+5. **Verificar interrupts por segundo:**
+
+```bash
+watch -n1 'cat /proc/interrupts | head -20'
+```
+
+---
+
+## Apéndice E: Changelog y Roadmap
+
+### E.1 Changelog v0.1.0
+
+**Fecha:** noviembre 2026 · **ABI:** `0x000100`
+
+**Características:**
+- ✅ Runtime de eventos con pool pre-asignado (cero `malloc` en el camino caliente)
+- ✅ Ring SPSC y cola MPMC acotada (Vyukov) lock-free, sin ABA
+- ✅ `SCHED_DEADLINE`/`SCHED_FIFO`, afinidad, `timerfd`, `mlockall` + *prefault*
+- ✅ Histograma de latencias con percentiles y WCET medido
+- ✅ Detección de kernel 5.15+ … 7.x (PREEMPT_RT, EEVDF, `sched_ext`, `io_uring`, AF_XDP, `memfd_secret`)
+- ✅ Resiliencia: snapshot A/B, WAL con CRC, *golden image* atómica, watchdog
+- ✅ Observabilidad: contadores, traza `trace_marker`, autotest de colas
+- ✅ SIMD AVX-512/AVX2/NEON/SVE con despacho en runtime
+- ✅ HAL: CRC-32C por instrucción, GF(2^8), Reed-Solomon SIMD, PHC/Launch Time
+- ✅ Maestro EtherCAT autónomo (`AF_PACKET`/`0x88A4`): escaneo, SM/FMMU, ESM, DC, CoE/SDO, WKC, redundancia
+- ✅ EtherTux v0.1.0 (`0x88B5`): cabecera de 26 B, QoS P0–P5, LAPM, FEC, ET-ESM, ET-Sync, ET-WKC/topología, ET-MBX, FRM, Flow Aggregator, anillo TX
+- ✅ Integración como proveedor (`tuxrt_provider_descriptor`) y puente desacoplado
+- ✅ 10 suites de test / 547 aserciones; 320 símbolos `ChronosRT_*`
+
+**Medido en el host de referencia (AMD Ryzen 7 4800H, Linux 7.2.11):**
+- Construir datagrama EtherCAT de 1024 B: 24,0 ns
+- Construir PDU EtherTux de 1464 B: 180,8 ns (140,8 ns sin copia)
+- CRC-32C `sse4.2-x4` con MTU: 9,70 GB/s (6,45 M tramas/s)
+
+### E.2 Roadmap
+
+**Exploratorio (no bloqueante):**
+- [ ] Planificador `sched_ext` (BPF) consciente de EtherCAT/DC
+- [ ] Ruta AF_XDP *zero-copy* para EtherTux
+- [ ] `io_uring` con `SQPOLL`
+- [ ] SVE real en kernels/compiladores que lo soporten
+- [ ] Secretos en `memfd_secret`
+- [ ] Validación física de EtherCAT/EtherTux en banco de pruebas
+
+---
+
+## Apéndice F: Conversiones de Diagramas a Mermaid
+
+### F.1 Resumen de diagramas convertidos
+
+| Sección | Diagrama original | Tipo Mermaid aplicado |
+|---------|-------------------|----------------------|
+| **1.1** | Arquitectura en capas (ASCII) | `flowchart TB` con `subgraph` por capa |
+| **1.2** | Árbol de componentes (ASCII) | `flowchart LR` con jerarquía de nodos |
+| **1.4** | Diagrama de estados del sistema (ASCII) | `stateDiagram-v2` con transiciones |
+| **2.3** | Secuencia maestro-esclavo (ASCII) | `sequenceDiagram` con `autonumber` |
+| **2.4** | Máquina de estados ESM (ASCII) | `stateDiagram-v2` con notas descriptivas |
+| **8.1** | Arquitectura de redundancia HA (ASCII) | `flowchart TB` con `subgraph` HA + nota de failover |
+| **13.14.1** | Arquitectura multi-NIC (ASCII) | `flowchart TB` con `subgraph` SIRC/NICS |
+
+### F.2 Funcionalidades Markdown verificadas
+
+- **Encabezados** (`#`, `##`, `###`, `####`) — TOC completo con 15 secciones + Apéndices A–F
+- **Tablas alineadas** (`:---`, `---:`) en toda la documentación
+- **Bloques de código** con lenguajes (`c`, `bash`, `asm`, `ini`, `text`)
+- **Citas / blockquote** (`>`) para notas técnicas, erratas y advertencias
+- **Listas ordenadas y no ordenadas** (planificación, checklists, roadmap)
+- **Enlaces internos** (TOC, referencias cruzadas §13.2, §11.4)
+- **Enlaces externos** (`file:///...` a fuentes del proyecto)
+- **Negritas / cursivas** (`**...**`, `*...*`)
+- **HTML embebido** (`<br/>`, `<strong>`)
+- **Mermaid** (7 diagramas convertidos desde ASCII)
+- **Alineación numérica** en tablas de rendimiento
+- **Superíndices** (`¹`) y notas al pie de tabla
+- **Checkboxes** en roadmap (`- [ ]`)
+- **Emojis** en changelog (`✅`)
+
