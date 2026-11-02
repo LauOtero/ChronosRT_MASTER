@@ -62,8 +62,9 @@ static void bucket_refill(et_bucket_t* b, const ChronosRT_et_bucket_cfg_t* cfg,
         dt = 1000000000ull;
     }
     b->last_ns = now_ns;
-    /* bytes = (dt_ns · rate_q32) >> 32, sin división de 64 bits. */
-    int64_t add = (int64_t)(((__uint128_t)dt * rate_q32) >> 32);
+    /* bytes = (dt_ns · rate_q32) >> 32, sin división de 64 bits.
+     * Usar multiplicación portable 64x64. */
+    int64_t add = (int64_t)(Q32_MUL((uint32_t)dt, (uint32_t)rate_q32));
     b->tokens = clamp_tokens(b->tokens + add, cfg->burst_bytes);
 }
 
@@ -195,11 +196,10 @@ ChronosRT_status_t ChronosRT_et_qos_configure(ChronosRT_et_qos_t* qos,
         qos->tb[i].tokens = (int64_t)cfg->bucket[i].burst_bytes;
         qos->tb[i].last_ns = 0u;
         qos->eff[i] = (uint8_t)i;
-        /* Q32: bytes por ns y 100/burst, ambos con recíproco fijo. */
-        qos->rate_q32[i] = (uint64_t)(((__uint128_t)cfg->bucket[i].rate_bytes_per_sec << 32)
-                                      / 1000000000ull);
-        qos->inv_burst_q32[i] = (uint64_t)(((__uint128_t)100u << 32)
-                                           / cfg->bucket[i].burst_bytes);
+        /* Q32: bytes por ns y 100/burst, ambos con recíproco fijo (portable, sin __uint128_t). */
+        qos->rate_q32[i] = Q32_RATE(cfg->bucket[i].rate_bytes_per_sec);
+        /* inv_burst_q32 = (100 × 2^32) / burst_bytes; cabida entera en 64 bits. */
+        qos->inv_burst_q32[i] = (uint64_t)(((uint64_t)100 << 32) / cfg->bucket[i].burst_bytes);
     }
     qos->lapm_active = false;
     qos->last_refill_ns = 0u;

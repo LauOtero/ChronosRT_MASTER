@@ -888,15 +888,28 @@ int ChronosRT_et_master_recv(ChronosRT_et_master_t* master,
         }
 
         /*
-         * Filtro de destino por ID local: en cuanto el maestro tiene su propia
-         * MAC LAA, cualquier trama unicast ajena se descarta aquí (coste
-         * constante, una comparación) en lugar de parsearla y validar su CRC.
-         */
-        if (master->local_id != ChronosRT_ET_LOCAL_ID_NONE &&
-            !ChronosRT_et_master_accepts_destination(master, master->rx_frame)) {
-            master->stats.local_id_dropped++;
-            continue;
+ * Filtro de destino por ID local: en cuanto el maestro tiene su propia
+ * MAC LAA, cualquier trama unicast ajena se descarta aquí (coste
+ * constante, una comparación) en lugar de parsearla y validar su CRC.
+ * Este check se realiza DESPUÉS de confirmar que la trama es EtherTux
+ * y tiene tamaño mínimo, ANTES de parsear la PDU y el CRC.
+ */
+        if (master->local_id != ChronosRT_ET_LOCAL_ID_NONE) {
+            uint8_t da0 = master->rx_frame[0];
+            if ((da0 & 0x01u) == 0u) {
+                /* Unicast: comparar con la MAC local LAA */
+                if (!master->port.mac_laa_valid) {
+                    (void)ChronosRT_et_aalid_mac(master->local_id, master->port.mac_laa);
+                    master->port.mac_laa_valid = true;
+                }
+                if (memcmp(master->rx_frame + 0, master->port.mac_laa, 6u) != 0) {
+                    master->stats.local_id_dropped++;
+                    continue;
+                }
+            }
+            /* Difusión (da0 & 0x01 != 0) siempre se acepta */
         }
+        /* Sin ID local: aceptar todo (comportamiento legacy) */
 
         uint32_t body_len = (uint32_t)n - ChronosRT_ET_ETH_HDR_SIZE;
         ChronosRT_et_header_t h;

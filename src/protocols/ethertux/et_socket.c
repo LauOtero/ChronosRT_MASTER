@@ -642,12 +642,12 @@ int et_socket_recv(et_port_t* port, uint8_t* frame, uint32_t bufsize,
         /* Verificar si la trama es EtherTux */
         uint16_t eth_type = (uint16_t)((frame[12] << 8) | frame[13]);
         if (eth_type == ChronosRT_ET_ETHERTYPE) {
-            if (n >= (ssize_t)(ChronosRT_ET_ETH_HDR_SIZE + ChronosRT_ET_HEADER_SIZE)) {
-                port->frames_rx++;
-                port->bytes_rx += (uint32_t)n;
-                return (int)n;
+            if (n < (ssize_t)(ChronosRT_ET_ETH_HDR_SIZE + ChronosRT_ET_HEADER_SIZE)) {
+                continue;   /* ajena o muy corta: sigue drenando */
             }
-            continue;   /* ajena: sigue drenando */
+            port->frames_rx++;
+            port->bytes_rx += (uint32_t)n;
+            return (int)n;
         }
         continue;   /* ajena: sigue drenando */
     }

@@ -34,6 +34,22 @@
 #define ET_NODE_HASH_SLOTS  256u
 #define ET_NODE_HASH_PROBES 8u
 
+/* ------------------------------------------------------------------ */
+/* Q32 fixed-point macros (32.32 format, portable, no __uint128_t) */
+/* ------------------------------------------------------------------ */
+
+/* Q32 multiplication: (a × b) >> 32, resulta en valor Q32 */
+#define Q32_MUL(a, b)                                    \
+    ((uint64_t)(((uint64_t)(a) * (uint64_t)(b)) >> 32))
+
+/* Q32 occupancy: used_burst × inv_burst_q32 >> 32 */
+#define Q32_OCCUPANCY_USED(used, inv_burst_q32)        \
+    ((uint32_t)(((uint64_t)(used) * (uint64_t)(inv_burst_q32)) >> 32))
+
+/* Q32 rate from bytes/sec: (rate × 2^32) / 1_000_000_000 */
+#define Q32_RATE(rate_bytes_per_sec)                     \
+    ((uint64_t)(((uint64_t)(rate_bytes_per_sec) << 32) / 1000000000ull))
+
 /* Ventanas del superframe (índices). */
 #define ET_WINDOW_CONTROL       0u
 #define ET_WINDOW_DETERMINISTIC 1u
@@ -47,7 +63,7 @@
 
 /* ------------------------------------------------------------------ */
 /* Puerto de red                                                       */
-/* ------------------------------------------------------------------ */
+/* Puerto de red */
 typedef struct {
     int      fd;
     uint8_t  mac[6];
@@ -68,6 +84,10 @@ typedef struct {
     uint32_t tx_head;             /* siguiente ranura candidata          */
     bool     tx_ring_active;
     bool     tx_reserved;         /* ranura reservada pendiente de commit */
+
+    /* LAA MAC caché para filtrado de destino rápido (evita CRC-32C por frame). */
+    bool     mac_laa_valid;       /* true cuando mac_laa está sincronizada */
+    uint8_t  mac_laa[6];          /* MAC LAA de este nodo (02:00:00:00:ID[15:8]:ID[7:0]) */
 } et_port_t;
 
 /* ------------------------------------------------------------------ */
