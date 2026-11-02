@@ -28,6 +28,9 @@
 extern "C" {
 #endif
 
+/* Constant for max adapters - must be defined before tuxrt_sirc_fast_t uses it */
+#define TUXRT_MAX_ADAPTERS 16
+
 /* ============================================================================
  * Tipos de error (compatibles con tuxrt_err_t de libtuxrt_core)
  * ============================================================================ */
@@ -184,6 +187,24 @@ struct tuxrt_transport_adapter_t {
 };
 
 /* ============================================================================
+ * Lock-free fast path for multi-NIC adapter selection
+ * ============================================================================ */
+
+/* Estructura para selección lock-free de adaptadores.
+   Proporciona acceso atómico a:
+   - adapter primary (rápido, hot path)
+   - adapters array (atómicos por índice)
+   - adapter_count (atómico)
+   - priority_map[6][TUXRT_MAX_ADAPTERS] → O(1) selección por priority */
+typedef struct {
+    _Atomic(tuxrt_transport_adapter_t*) primary;
+    _Atomic(tuxrt_transport_adapter_t*) adapters[TUXRT_MAX_ADAPTERS];
+    _Atomic uint32_t adapter_count;
+
+    uint8_t priority_map[6][TUXRT_MAX_ADAPTERS];  // priority → adapter indices
+} tuxrt_sirc_fast_t;
+
+/* ============================================================================
  * Multi-NIC SIRC Configuration
  * ============================================================================ */
 
@@ -207,8 +228,7 @@ typedef struct {
 struct tuxrt_transport_adapter_t;
 struct tuxrt_sirc_t;
 
-/* Constant for max adapters */
-#define TUXRT_MAX_ADAPTERS 16
+/* Constant for max adapters (already defined earlier) */
 #define TUXRT_HEALTH_HISTORY_SIZE 1024
 
 /* Circuit breaker states */
@@ -260,6 +280,9 @@ struct tuxrt_sirc_t {
     bool failover_prepared[TUXRT_MAX_ADAPTERS];
     uint64_t circuit_breaker_count;
     uint64_t failover_count;
+
+    /* Fast path lock-free multi-NIC adapter selection */
+    tuxrt_sirc_fast_t sirc_fast;
 };
 
 /* ============================================================================

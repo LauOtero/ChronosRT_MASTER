@@ -487,8 +487,55 @@ static ChronosRT_status_t et_send_frame_ex(ChronosRT_et_master_t* master,
     }
 
     /* Ventana time-triggered (si hay planificador asociado). P0 siempre pasa. */
-    if (master->sched != NULL &&
-        !ChronosRT_et_sched_can_transmit(master->sched, priority, now)) {
+    if (master->sched != NULL) {
+        /* RS-10: usar timestamp único y ventanas precomputadas.
+         * Llamada única a tx_timestamp_ns() en lugar de dos llamadas duplicadas.
+         * El cálculo de deadline usa ventanas precomputadas en sched->window_ns[]
+         * sin división costosa en el camino caliente. */
+        uint64_t now = ChronosRT_tx_timestamp_ns();
+        bool paced = true;
+        if (paced) {
+            uint8_t window = ChronosRT_et_sched_window_at(master->sched, now);
+            /* Determinar el inicio de la ventana actual usando valores precomputados. */
+            uint64_t window_start = master->sched->window_ns[window];
+            /* Si ya estamos past la ventana actual, programar la próxima.
+             * Estrategia: window_start + n * cycle_ns donde n es el número de ciclo. */
+            if (now >= window_start) {
+                /* Calcular el próximo inicio de ventana para esta prioridad.
+                 * Usar la fórmula: si now está en la ventana actual,
+                 * la próxima ventana es la siguiente en la secuencia. */
+                uint64_t next_window_start;
+                if (priority == ChronosRT_ET_P0) {
+                    /* P0 puede transmitir en cualquier ventana; next_window_start = window actual + cycle */
+                    next_window_start = window_start + master->sched->cycle_ns;
+                } else {
+                    /* Para P1-P5, determinar la ventana por prioridad */
+                    uint8_t target_window;
+                    if (priority == ChronosRT_ET_P1) {
+                        target_window = ET_WINDOW_CONTROL;
+                    } else if (priority == ChronosRT_ET_P2) {
+                        target_window = ET_WINDOW_DETERMINISTIC;
+                    } else if (priority <= 4) {
+                        target_window = ET_WINDOW_RATE;
+                    } else {
+                        target_window = ET_WINDOW_BEST_EFFORT;
+                    }
+                    /* Calcular next_window_start basándose en la ventana objetivo.
+                     * Si now ya pasó la ventana objetivo en el cycle actual,
+                     * usar el siguiente cycle. */
+                    next_window_start = master->sched->window_ns[target_window];
+                    if (now >= next_window_start) {
+                        next_window_start += master->sched->cycle_ns;
+                    }
+                }
+                deadline_ns = next_window_start;
+            }
+        }
+        if (!ChronosRT_et_sched_can_transmit(master->sched, priority, now)) {
+            master->stats.backpressure++;
+            return ChronosRT_ERROR_BACKPRESSURE;
+        }
+    } else if (!ChronosRT_et_sched_can_transmit(master->sched, priority, now)) {
         master->stats.backpressure++;
         return ChronosRT_ERROR_BACKPRESSURE;
     }
@@ -830,7 +877,7 @@ int ChronosRT_et_master_recv(ChronosRT_et_master_t* master,
     for (unsigned attempt = 0; attempt < 8u; attempt++) {
         int n = et_socket_recv(&master->port, master->rx_frame,
                                ChronosRT_ET_MAX_FRAME,
-                               (attempt == 0u) ? timeout_us : 0u);
+                               (attempt == 0u) ? timeout_us : 0u, NULL);
         if (n < 0) {
             return -1;
         }

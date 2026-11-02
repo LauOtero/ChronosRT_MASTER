@@ -164,7 +164,7 @@ int      et_socket_send_batch(et_port_t* port, struct mmsghdr* msgs, uint32_t co
 int      et_socket_send_at(et_port_t* port, const uint8_t* frame, uint32_t len,
                            uint64_t deadline_ns);
 int      et_socket_recv(et_port_t* port, uint8_t* frame, uint32_t bufsize,
-                        uint32_t timeout_us);
+                       uint32_t timeout_us, uint64_t* out_rx_timestamp);
 bool     et_socket_txtime_enabled(const et_port_t* port);
 /** Velocidad del enlace en bps desde sysfs; 0 si no se puede leer. */
 uint64_t et_socket_link_bps(const char* ifname);

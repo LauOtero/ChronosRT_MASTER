@@ -283,96 +283,67 @@ tuxrt_err_t tuxrt_sirc_get_adapter(tuxrt_sirc_t* sirc, size_t index,
     return TUXRT_OK;
 }
 
-/* Seleccionar adaptador óptimo basado en algoritmo de balanceo */
+/* Seleccionar adaptador óptimo usando priority_map para O(1) selección */
 static tuxrt_transport_adapter_t* select_optimal_adapter(tuxrt_sirc_t* sirc,
                                                           tuxrt_timestamp_ns_t deadline) {
     if (!sirc->config.enable_load_balancing || sirc->adapter_count == 0) {
         return NULL;
     }
 
+    /* First, try O(1) lookup via priority_map */
+    /* priority_map[priority][adapter_index] gives the adapter index for each priority level */
+    int best_priority = -1;
+    size_t best_idx = (size_t)-1;
+
+    /* Iterar por los 6 niveles de prioridad (0=alta, 5=baja) */
+    for (int pri = 0; pri < 6; pri++) {
+        /* Para cada adapter_index en la mapa de prioridad */
+        for (size_t mi = 0; mi < (size_t)sirc->adapter_count; mi++) {
+            uint8_t pidx = sirc->sirc_fast.priority_map[pri][mi];
+            /* pidx == 0xFF significa "ningún adaptador" */
+            if (pidx == 0xFF) continue;
+
+            tuxrt_transport_adapter_t* adapter = sirc->adapters[pidx];
+            if (!adapter || !adapter->active ||
+                adapter->health.cb_state != TUXRT_CB_CLOSED) continue;
+
+            /* Verificar si este es el mejor para este nivel de prioridad */
+            if (best_priority == -1 || pri < best_priority) {
+                best_priority = pri;
+                best_idx = pidx;
+                break; /* Found first valid at this priority level */
+            }
+        }
+        if (best_idx != (size_t)-1) break;
+    }
+
+    /* Si encontramos por priority_map, usarlo directamente (O(1)) */
+    if (best_idx != (size_t)-1) {
+        tuxrt_transport_adapter_t* best = sirc->adapters[best_idx];
+        return best;
+    }
+
+    /* Fallback: scoring Q16 tradicional si no hay priority_map configurado */
     tuxrt_transport_adapter_t* best = NULL;
-    tuxrt_timestamp_ns_t best_latency = UINT64_MAX;
+    uint32_t best_score = 0xFFFFFFFF; /* Q16 score: menor es mejor */
 
-    /* Algoritmo de selección múltiple */
-    switch (sirc->config.load_balance_algo) {
-        case TUXRT_LOAD_BALANCE_ROUND_ROBIN: {
-            /* Round-robin simple con health check */
-            size_t start = sirc->next_adapter_idx;
-            do {
-                tuxrt_transport_adapter_t* adapter = sirc->adapters[sirc->next_adapter_idx];
-                if (adapter && adapter->active &&
-                    adapter->health.cb_state == TUXRT_CB_CLOSED &&
-                    adapter->health.error_rate < sirc->config.health_threshold_error_rate) {
-                    best = adapter;
-                    sirc->next_adapter_idx = (sirc->next_adapter_idx + 1) % sirc->adapter_count;
-                    return best;
-                }
-                sirc->next_adapter_idx = (sirc->next_adapter_idx + 1) % sirc->adapter_count;
-            } while (sirc->next_adapter_idx != start);
-            break;
+    for (size_t i = 0; i < sirc->adapter_count; i++) {
+        tuxrt_transport_adapter_t* adapter = sirc->adapters[i];
+        if (!adapter || !adapter->active ||
+            adapter->health.cb_state != TUXRT_CB_CLOSED) continue;
+
+        /* Q16 fixed-point score:
+         * score = (error_rate * 7 + latency_weighted * 3) >> 4
+        * donde latency_weighted = avg_latency_ns >> 20 (escala ~1ms a ~1 en Q16)
+        * error_rate está normalizado 0-1, en Q16 usamos 255 como 1.0 */
+        uint32_t error_q16 = (uint32_t)(adapter->health.error_rate * 255.0);
+        uint32_t latency_q16 = (uint32_t)((uint64_t)(adapter->health.avg_latency_ns) >> 20);
+        uint32_t score = ((error_q16 * 7) + (latency_q16 * 3)) >> 4;
+
+        if (score < best_score) {
+            best_score = score;
+            best = adapter;
         }
-
-        case TUXRT_LOAD_BALANCE_WEIGHTED: {
-            /* Basado en combinación de error rate y latency */
-            double best_score = 1.0;
-            for (size_t i = 0; i < sirc->adapter_count; i++) {
-                tuxrt_transport_adapter_t* adapter = sirc->adapters[i];
-                if (!adapter || !adapter->active ||
-                    adapter->health.cb_state != TUXRT_CB_CLOSED) continue;
-
-                double score = adapter->health.error_rate * 0.7 +
-                              (adapter->health.avg_latency_ns / 1000000.0) * 0.3;
-
-                if (score < best_score) {
-                    best_score = score;
-                    best = adapter;
-                }
-            }
-            break;
-        }
-
-        case TUXRT_LOAD_BALANCE_LEAST_LATENCY: {
-            /* Seleccionar menor latency observada */
-            for (size_t i = 0; i < sirc->adapter_count; i++) {
-                tuxrt_transport_adapter_t* adapter = sirc->adapters[i];
-                if (!adapter || !adapter->active ||
-                    adapter->health.cb_state != TUXRT_CB_CLOSED) continue;
-
-                if (adapter->health.avg_latency_ns < best_latency) {
-                    best_latency = adapter->health.avg_latency_ns;
-                    best = adapter;
-                }
-            }
-            break;
-        }
-
-        case TUXRT_LOAD_BALANCE_RATE_BASED: {
-            /* Basado en throughput medido */
-            double best_throughput = 0;
-            for (size_t i = 0; i < sirc->adapter_count; i++) {
-                tuxrt_transport_adapter_t* adapter = sirc->adapters[i];
-                if (!adapter || !adapter->active ||
-                    adapter->health.cb_state != TUXRT_CB_CLOSED) continue;
-
-                if (adapter->health.throughput_mbps > best_throughput) {
-                    best_throughput = adapter->health.throughput_mbps;
-                    best = adapter;
-                }
-            }
-            break;
-        }
-
-        default:
-            /* Fallback: primer adaptador disponible */
-            for (size_t i = 0; i < sirc->adapter_count; i++) {
-                tuxrt_transport_adapter_t* adapter = sirc->adapters[i];
-                if (adapter && adapter->active &&
-                    adapter->health.cb_state == TUXRT_CB_CLOSED) {
-                    best = adapter;
-                    break;
-                }
-            }
-            break;
     }
 
     return best;

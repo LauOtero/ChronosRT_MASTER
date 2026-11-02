@@ -110,6 +110,7 @@ set(CHRONOSRT_SOURCES
     src/core/chronosrt_obs.c
     # Plataforma: detección y validación del kernel
     src/platform/chronosrt_kernel.c
+    src/platform/chronosrt_net_probe.c
     # HAL de aceleración por hardware (CRC-32C, GF(2^8), Reed-Solomon)
     src/hwaccel/chronosrt_hwaccel.c
     # Adaptador de transporte (USB, UART, CAN, Ethernet, SPI, I2C, EtherCAT, EtherTux)

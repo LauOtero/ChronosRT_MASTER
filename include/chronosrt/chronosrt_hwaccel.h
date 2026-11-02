@@ -79,6 +79,13 @@ typedef struct {
     bool        isa_aes;
     bool        isa_bmi2;        /* MULX / RORX / PEXT / PDEP                */
     bool        isa_adx;         /* ADCX / ADOX                              */
+
+    /* --- Capacidades de red (universalización HAL §4.1) --- */
+    bool        is_usb_bus;          /* TRUE si la interfaz está en bus USB (rechazo inmediato) */
+    bool        is_native_pcie;      /* TRUE si está en PCIe/AXI nativo (determinista) */
+    uint64_t    phc_clock_id;        /* ID del reloj PTP asociado (si existe) */
+    bool        has_ptp_multicast;   /* Soporte para filtrado PTP en HW */
+    uint32_t    max_mtu;             /* Tamaño máximo de trama (zero-copy) */
 } ChronosRT_hw_caps_t;
 
 /*
@@ -108,6 +115,64 @@ CHRONOSRT_API const ChronosRT_hw_caps_t* ChronosRT_hw_caps(void);
  */
 CHRONOSRT_API ChronosRT_status_t ChronosRT_hw_caps_for_interface(const char* ifname,
                                                                 ChronosRT_hw_caps_t* out);
+
+/* ------------------------------------------------------------------ */
+/* Sonda universal de capacidades de red (Fase 0: universalización HAL) */
+/* ------------------------------------------------------------------ */
+
+/* Tipo de driver Ethernet detectado */
+typedef enum {
+    CHRONOSRT_DRIVER_UNKNOWN = 0,
+    CHRONOSRT_DRIVER_IGB,
+    CHRONOSRT_DRIVER_IGC,
+    CHRONOSRT_DRIVER_IXGbe,
+    CHRONOSRT_DRIVER_E1000E,
+    CHRONOSRT_DRIVER_R8169,
+    CHRONOSRT_DRIVER_R8125,
+    CHRONOSRT_DRIVER_STMMAC,
+    CHRONOSRT_DRIVER_ENETC,
+    CHRONOSRT_DRIVER_LAN966X,
+    CHRONOSRT_DRIVER_MACB,
+    CHRONOSRT_DRIVER_TSNEP,
+    CHRONOSRT_DRIVER_COUNT
+} ChronosRT_net_driver_t;
+
+/* Estructura completa de capacidades por interfaz (sección 4.1 del documento) */
+typedef struct {
+    ChronosRT_net_driver_t driver_type;   /* Tipo de driver detectado */
+    bool has_hw_timestamp;    /* TX/RX IEEE 1588v2 en PHY */
+    bool has_hw_rx_timestamp; /* RX hardware timestamping disponible */
+    bool has_launch_time;     /* SO_TXTIME/ETF real */
+    bool has_hw_taprio;       /* IEEE 802.1Qbv (Shaper TDMA) */
+    uint32_t hardware_queues; /* Colas físicas del chip */
+
+    /* --- Campos para universalidad y seguridad determinista --- */
+    bool is_usb_bus;          /* TRUE si la interfaz está en bus USB */
+    bool is_native_pcie;      /* TRUE si está en PCIe/AXI nativo */
+    uint64_t phc_clock_id;    /* ID del reloj PTP asociado (si existe) */
+    bool has_ptp_multicast;   /* Soporte para filtrado PTP en HW */
+    uint32_t max_mtu;         /* Tamaño máximo de trama (zero-copy) */
+} ChronosRT_net_caps_t;
+
+/**
+ * ChronosRT_net_probe() — Sonda completa de una interfaz de red.
+ *
+ * Realiza detección en tres capas:
+ *   Capa 1: sysfs — rechaza bus USB inmediatamente (código -2)
+ *   Capa 2: ETHTOOL_GDRVINFO — identifica driver contra tabla extensible
+ *   Capa 3: Prueba empírica SO_TXTIME/TAPRIO en runtime
+ *
+ * Parámetros:
+ *   ifname   - Nombre de la interfaz (p. ej. "eth0", "enx0")
+ *   out      - Puntero a ChronosRT_net_caps_t que será llenado
+ *
+ * Retorna:
+ *   0  -> Éxito, la interfaz es apta
+ *   -1 -> Error de parámetros
+ *   -2 -> Interfaz en bus USB: RECHAZADA inmediatamente
+ *   -3 -> No se pudo obtener información de la interfaz
+ */
+CHRONOSRT_API int ChronosRT_net_probe(const char* ifname, ChronosRT_net_caps_t* out);
 
 /* ------------------------------------------------------------------ */
 /* CRC-32C (Castagnoli, polinomio reflejado 0x82F63B78)                */

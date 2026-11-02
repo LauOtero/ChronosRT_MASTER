@@ -102,6 +102,7 @@ typedef struct {
     uint8_t  flow_id;       /* 1..255                                    */
     uint32_t seq_num;       /* secuencia por flujo                       */
     uint64_t tx_timestamp;  /* ns del reloj monotónico en la transmisión */
+    uint64_t rx_timestamp;  /* ns del reloj monotónico en la recepción */
     uint16_t wkc;           /* ET-WKC: nodos que procesaron la trama     */
     uint16_t block_id;      /* (bloque << 8) | índice dentro del bloque  */
     uint8_t  flow_count;    /* flujos agrupados (1 = sin agregación)     */

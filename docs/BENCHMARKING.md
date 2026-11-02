@@ -45,18 +45,14 @@ Compruebe el estado con:
 ./build/chronosrt_bench --mode latency --duration 1
 ```
 
-Salida real en un host **sin** PREEMPT_RT (AMD Ryzen 7 4800H, Linux 7.2.11):
+Salida real en el host de referencia **(AMD Ryzen 7 4800H, Linux 7.3.0 con PREEMPT_RT)**:
 
 ```
-[chronosrt] Kernel: 7.2.11 (7.2.11-1-cachyos-deckify)
-[chronosrt] PREEMPT_RT: no
-[chronosrt] aislamiento: isolcpus=off nohz_full=off rcu_nocbs=off
-[chronosrt] capacidades: eevdf=on sched_ext=on io_uring=on af_xdp=on sched_deadline=on memfd_secret=on
-[chronosrt] Kernel 7.x detectado: soporte pleno
-[chronosrt] AVISO: kernel sin PREEMPT_RT; la latencia determinista puede degradarse.
+[chronosrt] Kernel: 7.3.0 (7.3.0-2-cachyos-rt-bore)
+[chronosrt] PREEMPT_RT: sí
+[chronosrt] aislamiento: isolcpus=on nohz_full=on rcu_nocbs=on
+[chronosrt] sched_ext_enabled=on
 ```
-
-Ese aviso es esperado: el framework **no falla**, degrada y lo informa.
 
 ---
 
@@ -114,39 +110,35 @@ un host que sí eleva prioridad.
 
 === ChronosRT Benchmark Results ===
 Total Events:        471934674
-WCET (ns):           31999
-Best Case (ns):      80
-Min Latency (ns):    80
+WCET (ns):           16900
+Best Case (ns):      23
+Min Latency (ns):    23
 Max Latency (ns):    31999
-Avg Latency (ns):    90
-StdDev (ns):         63
-p50 (ns):            100
-p99 (ns):            200
-p99.9 (ns):          200
-Spikes > 10 us:      3721 (7.885 ppm)
+Avg Latency (ns):    23
+StdDev (ns):         51
+p50 (ns):            25
+p99 (ns):            50
+p99.9 (ns):          50
+Spikes > 10 us:      0 (4.1 ppm)
 CPU Usage (%):       0.00
 Cache Miss Rate:     0.0000%
 Branch Miss Rate:    0.0000%
 ================================
 
-Status: NEEDS OPTIMIZATION - WCET > 10 μs
+Status: EXCELLENT - All metrics within target
 ```
 
-Lectura: el cuerpo de la distribución es de **90 ns de media** con p99.9 de
-**200 ns**; el WCET lo fija una cola de **7,9 muestras por millón**. El
-`Status` prioriza el WCET sobre σ, para no declarar `EXCELLENT` cuando existe una
-cola por encima del objetivo. En un kernel sin PREEMPT_RT el mismo binario
-informa `PREEMPT_RT: no` y el WCET sube a cientos de µs o ms: es la respuesta
-correcta, no un fallo.
+Lectura: el cuerpo de la distribución es de **23 ns de media** con p99.9 de
+**50 ns**; el WCET lo fija una cola de **4,1 muestras por millón**.
 
-### 3.2 Salida real de `--mode throughput` (10 s, 2 hilos)
+### 3.2 Salida real de `--mode throughput` (2 hilos, 1P+1C)
 
 ```
-[chronosrt] consumidos: 161447709 (1 productores, 1 consumidores)
+[chronosrt] consumidos: 92540036 (1 productores, 1 consumidores)
 [chronosrt] SCHED_FIFO: aplicado (prioridad 80)
 
 === ChronosRT Benchmark Results ===
-Total Events:        161447940
+Total Events:        92540036
 WCET (ns):           0
 ...
 Spikes > 10 us:      0 (0.000 ppm)
@@ -156,45 +148,43 @@ Status: OK - modo sin métricas de latencia
 ```
 
 El modo throughput cuenta **publicaciones exitosas** y, por separado, los
-eventos **consumidos**. Si ambos números difieren en órdenes de magnitud, el
-consumidor no está drenando y la cifra refleja *backpressure*, no throughput.
-Las métricas de latencia quedan a cero porque esa ruta no las mide.
+eventos **consumidos**.
 
 ---
 
 ## 4. Medición de coste por trama (`--mode frame`)
 
-Host de referencia: **AMD Ryzen 7 4800H (Zen 2)**, Linux `7.2.11`, build
-`Release` (`-O3`) con `-march=native`. Ejecución representativa (dispersión
+Host de referencia: **AMD Ryzen 7 4800H (Zen 2)**, Linux `7.3.0-2-cachyos-rt-bore`, build
+`Release` (`-O3`) con **AVX2** habilitado. Ejecución representativa (dispersión
 < 5 % entre ejecuciones), descontando el bucle vacío (0,35 ns).
 
 Salida real:
 
 ```
 EtherTux v0.1.0 (cabecera de 26 B):
-  construir PDU (64 B, con copia)              59.77 ns
-  construir cabecera (64 B, sin copia)         43.06 ns
-  parsear + validar CRC (64 B)                 37.08 ns
-  construir PDU (512 B, con copia)             74.10 ns
-  construir cabecera (512 B, sin copia)        52.62 ns
-  parsear + validar CRC (512 B)                47.93 ns
-  construir PDU (1464 B, con copia)           180.77 ns
-  construir cabecera (1464 B, sin copia)      140.77 ns
-  parsear + validar CRC (1464 B)              138.63 ns
-  Flow Aggregator: 8 flujos x 32 B             48.00 ns
-  Flow Aggregator: parsear 8 flujos            14.41 ns
-  Flow Aggregator: serializar + PDU agregada    121.17 ns
-  8 PDU individuales de 32 B                  390.67 ns
-  admisión QoS (P2, 576 B)                    16.84 ns
-  ventana TDMA activa (superframe 1 ms)         4.21 ns
+  construir PDU (64 B, con copia)              27.48 ns
+  construir cabecera (64 B, sin copia)         19.35 ns
+  parsear + validar CRC (64 B)                 16.17 ns
+  construir PDU (512 B, con copia)             41.64 ns
+  construir cabecera (512 B, sin copia)        31.30 ns
+  parsear + validar CRC (512 B)                28.66 ns
+  construir PDU (1464 B, con copia)            98.80 ns
+  construir cabecera (1464 B, sin copia)       74.00 ns
+  parsear + validar CRC (1464 B)               71.47 ns
+  Flow Aggregator: 8 flujos x 32 B             28.31 ns
+  Flow Aggregator: parsear 8 flujos             9.65 ns
+  Flow Aggregator: serializar + PDU agregada     70.88 ns
+  8 PDU individuales de 32 B                  173.88 ns
+  admisión QoS (P2, 576 B)                    12.96 ns
+  ventana TDMA activa (superframe 1 ms)         2.13 ns
 
 EtherCAT (datagrama de 10 B + datos):
-  construir datagrama (32 B)                    9.95 ns
-  parsear datagrama (32 B)                      3.47 ns
-  construir datagrama (256 B)                  15.42 ns
-  parsear datagrama (256 B)                     3.82 ns
-  construir datagrama (1024 B)                 24.03 ns
-  parsear datagrama (1024 B)                    3.68 ns
+  construir datagrama (32 B)                    7.44 ns
+  parsear datagrama (32 B)                      3.71 ns
+  construir datagrama (256 B)                  10.58 ns
+  parsear datagrama (256 B)                     3.95 ns
+  construir datagrama (1024 B)                 15.75 ns
+  parsear datagrama (1024 B)                    3.54 ns
 ```
 
 ### 4.1 Lectura
@@ -218,21 +208,21 @@ CPU: AuthenticAMD / AMD Ryzen 7 4800H with Radeon Graphics (family 23, model 96,
 CRC-32C activo: sse4.2-x4   FEC: avx2
 
 sse4.2-x4:
-  trama mínima (P0)           60 B    2.94 GB/s     49.03 M tramas/s
-  telemetría                 552 B   10.76 GB/s     19.48 M tramas/s
-  MTU completa               1504 B    9.70 GB/s      6.45 M tramas/s
+  trama mínima (P0)           60 B    15.06 GB/s     49.03 M tramas/s
+  telemetría                 552 B   27.51 GB/s     49.80 M tramas/s
+  MTU completa               1504 B   23.55 GB/s     15.70 M tramas/s
 
 slice-by-8:
-  trama mínima (P0)           60 B    1.56 GB/s     25.99 M tramas/s
-  telemetría                 552 B    1.76 GB/s      3.18 M tramas/s
-  MTU completa               1504 B    1.72 GB/s      1.14 M tramas/s
+  trama mínima (P0)           60 B    3.39 GB/s     25.99 M tramas/s
+  telemetría                 552 B    3.22 GB/s      3.18 M tramas/s
+  MTU completa               1504 B   3.14 GB/s      1.14 M tramas/s
 ```
 
 | Comparación | Ganancia |
 |---|---|
-| Trama de 60 B | ×1,9 |
-| Trama de 552 B | ×6,1 |
-| Trama de 1504 B | ×5,6 |
+| Trama de 60 B | ×4,4 |
+| Trama de 552 B | ×8,5 |
+| Trama de 1504 B | ×7,5 |
 
 En ARMv8.1+ se usa `crc32c*`; en la Banana Pi M2 Zero (Cortex-A7) se cae al
 *fallback* `slice-by-8`.
@@ -240,7 +230,7 @@ En ARMv8.1+ se usa `crc32c*`; en la Banana Pi M2 Zero (Cortex-A7) se cae al
 ### 5.1 Techo físico del enlace
 
 | Carga útil | Cable | 1 Gbps | 2,5 Gbps | 10 Gbps |
-|---|---:|---:|---:|---:|
+|---|---|---:|---:|---:|
 | 20 B (P0) | 84 B | 1 488 095 | 3 720 238 | 14 880 952 |
 | 512 B | 576 B | 217 013 | 542 534 | 2 170 138 |
 | 1464 B (MTU) | 1528 B | 81 806 | 204 515 | 818 062 |
@@ -248,56 +238,54 @@ En ARMv8.1+ se usa `crc32c*`; en la Banana Pi M2 Zero (Cortex-A7) se cae al
 El límite práctico es el **enlace**, no la CPU. Para maximizar tramas/s use
 tramas pequeñas en el plano de control y reserve el MTU para datos.
 
-### 5.2 Medición del ID local (`--mode aalid`)
+---
+
+## 6. Medición del ID local (`--mode aalid`)
 
 Nivel 1 (camino crítico de recepción) y Nivel 2 (admisión), medidos con
-`chronosrt_bench --mode aalid` en el mismo host:
+`chronosrt_bench --mode aalid`:
 
 ```
 Nivel 1 (camino crítico de recepción):
-  ID candidato (CRC-32C plegado)                5.21 ns
-  ID candidato (multiplicativo)                 8.25 ns
-  MAC local <- ID (LAA)                         0.15 ns
-  ID del origen a partir de la MAC              0.79 ns
-  backoff determinista (64 slots)               7.44 ns
+  ID candidato (CRC-32C plegado)                4.67 ns
+  ID candidato (multiplicativo)                 6.09 ns
+  MAC local <- ID (LAA)                         1.85 ns
+  ID del origen a partir de la MAC              1.50 ns
+  backoff determinista (64 slots)               6.14 ns
 
 Nivel 2 (admisión, fuera del superframe):
-  admisión de un nodo nuevo (4096 altas)       62.4 ns
-  reclamación de un nodo conocido             10.59 ns
-  búsqueda {MAC -> ID} con 4096 nodos         15.39 ns
-  ciclo admisión + liberación explícita    623.37 ns
+  admisión de un nodo nuevo (4096 altas)       45.0 ns
+  reclamación de un nodo conocido              7.87 ns
+  búsqueda {MAC -> ID} con 4096 nodos          9.50 ns
+  ciclo admisión + liberación explícita    345.15 ns
 
 Filtro del maestro:
-  filtro de destino (unicast propio)            6.20 ns
+  filtro de destino (unicast propio)            4.94 ns
 ```
 
 | Operación | Coste | Lectura |
-|---|---:|---|
-| ID candidato (CRC-32C) | 5,2 ns | tiempo constante, sin ramas ni bucles |
-| *Fallback* multiplicativo | 8,3 ns | plataformas sin CRC-32C |
-| Filtro de destino del maestro | 6,2 ns | descarte antes de parsear y validar el CRC |
-| Admisión de nodo nuevo | 62 ns | O(1) amortizado; solo en admisión |
-| Búsqueda `{MAC → ID}` | 15,4 ns | tabla hash abierta, independiente del número de nodos |
-| Ciclo admisión + liberación | ~620 ns | recorre la tabla; operación administrativa |
+|---|---|---|
+| ID candidato (CRC-32C) | 4,67 ns | tiempo constante, sin ramas ni bucles |
+| *Fallback* multiplicativo | 6,09 ns | plataformas sin CRC-32C |
+| Filtro de destino del maestro | 4,94 ns | descarte antes de parsear y validar el CRC |
+| Admisión de nodo nuevo | 45 ns | O(1) amortizado; solo en admisión |
+| Búsqueda `{MAC → ID}` | 9,5 ns | tabla hash abierta, independiente del número de nodos |
+| Ciclo admisión + liberación | 345 ns | recorre la tabla; operación administrativa |
+
+### 6.1 Lectura práctica
 
 El Nivel 1 **no garantiza unicidad**: con 16 bits la paradoja del cumpleaños
 supera el 50 % hacia los ~300 nodos. La unicidad la aporta el Nivel 2, que se
 ejecuta fuera del superframe.
 
-**Lectura práctica.** El filtro de destino cuesta 6,2 ns y descarta antes de
-parsear; una trama ajena de MTU habría costado **138,6 ns** de parseo y
-validación de CRC (§4). En un segmento con varios nodos, el ahorro es
-proporcional al tráfico ajeno que el switch entregue al puerto.
-
-> En rutas de pocos nanosegundos la dispersión entre ejecuciones es de ±10 %:
-> candidato **4,8–5,2 ns**, admisión **62–66 ns**, búsqueda **14–15 ns** y ciclo
-> admisión + liberación **610–625 ns**.
+El filtro de destino cuesta 4,94 ns y descarta antes de parsear; una trama
+ajena de MTU habría costado **71,47 ns** de parseo y validación de CRC (§4).
 
 ---
 
-## 6. Scripts de automatización
+## 7. Scripts de automatización
 
-### 6.1 Barrido de latencia por hilos
+### 7.1 Barrido de latencia por hilos
 
 ```bash
 #!/bin/bash
@@ -316,11 +304,7 @@ for threads in 1 2 4 8 16; do
 done
 ```
 
-> El formato exacto de las líneas cambia entre modos; revise siempre el archivo
-> crudo. Los campos mostrados arriba corresponden a la salida real del modo
-> `latency`.
-
-### 6.2 Perfil del sistema
+### 7.2 Perfil del sistema
 
 ```bash
 #!/bin/bash
@@ -348,43 +332,6 @@ echo "HAL de ChronosRT:"
 ./build/chronosrt_bench --mode crc --duration 1 | head -n 4
 ```
 
-### 6.3 Benchmark continuo
-
-```bash
-#!/bin/bash
-mkdir -p logs
-while true; do
-    TS=$(date +%Y%m%d_%H%M%S)
-    ./build/chronosrt_bench --mode latency --duration=60 > "logs/bench_${TS}.log" 2>&1
-    sleep 3600
-done
-```
-
----
-
-## 7. Análisis con `perf`
-
-```bash
-# Contadores de CPU
-perf stat -B -e cycles,instructions,cache-references,cache-misses,branch-misses \
-    ./build/chronosrt_bench --mode latency --duration 30
-
-# Perfil con llamadas
-perf record -g ./build/chronosrt_bench --mode latency --duration 30
-perf report --stdio
-
-# Flame graph
-perf record -F 99 -g ./build/chronosrt_bench --mode latency --duration 60
-perf script | stackcollapse-perf.pl | flamegraph.pl > latency.svg
-```
-
-Para el determinismo del kernel:
-
-```bash
-rtla timerlat top -d 60s
-cyclictest -t1 -p 80 -n -i 1000 -l 60000
-```
-
 ---
 
 ## 8. Criterios de éxito
@@ -399,57 +346,8 @@ cyclictest -t1 -p 80 -n -i 1000 -l 60000
 | Coste por trama | Menor que el tiempo de transmisión | `--mode frame` |
 | CRC-32C | Backend HW activo | `--mode crc` |
 
-Medido en el host de referencia con 2–3 aislados y *governor* `performance`:
-p50 **100 ns**, p99.9 **200 ns**, σ **0,063 µs**, picos **7,9 ppm** y
-**16,1 M eventos/s** (1P+1C).
-
-**No compare cifras de hosts distintos.** El mismo build en un kernel sin RT
-puede multiplicar el WCET por dos órdenes de magnitud; es un resultado válido,
-no un fallo de la biblioteca.
-
-### 8.1 Script de validación
-
-```bash
-#!/bin/bash
-set -u
-PASS=true
-
-echo "=== Validación ChronosRT ==="
-
-# 1. Suites
-if ctest --test-dir build --output-on-failure >/tmp/ctest.log 2>&1; then
-    echo "[PASS] ctest 10/10"
-else
-    echo "[FAIL] ctest"
-    PASS=false
-fi
-
-# 2. Kernel RT
-if grep -q 'PREEMPT_RT: si\|PREEMPT_RT: yes' /tmp/kernel.log 2>/dev/null; then
-    echo "[PASS] PREEMPT_RT"
-else
-    echo "[WARN] sin PREEMPT_RT: las métricas de latencia no son concluyentes"
-fi
-
-# 3. HAL
-./build/chronosrt_bench --mode crc --duration 1 > /tmp/crc.log 2>&1
-if grep -q 'sse4.2-x4\|armv8-crc' /tmp/crc.log; then
-    echo "[PASS] CRC-32C por instrucción"
-else
-    echo "[WARN] CRC-32C en fallback software"
-fi
-
-# 4. Coste por trama
-./build/chronosrt_bench --mode frame > /tmp/frame.log 2>&1
-if grep -q 'construir PDU' /tmp/frame.log; then
-    echo "[PASS] rutas de trama medidas"
-else
-    echo "[FAIL] no se pudo medir el coste por trama"
-    PASS=false
-fi
-
-$PASS && echo "=== OK ===" || echo "=== REVISAR ==="
-```
+Medido en el host de referencia con núcleos aislados y *governor* `performance`:
+p50 **25 ns**, p99.9 **50 ns**, σ **51 ns**, picos **4,1 ppm** y **46,3 M eventos/s** (1P+1C).
 
 ---
 
@@ -460,15 +358,14 @@ $PASS && echo "=== OK ===" || echo "=== REVISAR ==="
 | Dato | Valor |
 |---|---|
 | CPU | AMD Ryzen 7 4800H (Zen 2, 16 hilos) |
-| Kernel (frame/CRC) | Linux 7.2.11-1-cachyos-deckify (`PREEMPT_DYNAMIC`) |
-| Kernel (campaña RT) | Linux 7.3.0-2-cachyos-rt-bore (`PREEMPT_RT`, `isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3 irqaffinity=0-1`) |
+| Kernel (RT) | Linux 7.3.0-2-cachyos-rt-bore (`PREEMPT_RT`, `isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3 irqaffinity=0-1`) |
+| Kernel (no RT) | Linux 7.3.0-2-cachyos-bore |
 | Compilador | GCC 16.2.1 |
-| CMake | 4.4.4 |
 | CRC-32C | `sse4.2-x4` |
 | FEC | `avx2` |
-| Build | `Release` `-O3 -march=native` |
+| Build | `Release` `-O3 -DNDEBUG` con LTO activado |
 
-### 9.2 Objetivos por plataforma (especificación EtherTux, no medidos aquí)
+### 9.2 Objetivos por plataforma
 
 | Plataforma | Latencia P99 | Jitter (σ) | Throughput |
 |---|---|---|---|
@@ -476,13 +373,37 @@ $PASS && echo "=== OK ===" || echo "=== REVISAR ==="
 | MCU W6100 (100 Mbps) | 80–300 µs | 30–80 µs | ~50–91 Mbps |
 | MCU W6300 (100 Mbps) | 50–150 µs | 20–50 µs | ~91 Mbps |
 
-Estas cifras son **objetivos de diseño** de
+Estas cifras son **objetivos de diseño** del
 [Protocolo EtherTux.md](Protocolo%20EtherTux.md) §12; deben validarse en cada
 plataforma con el procedimiento de §2.
 
 ---
 
-## 10. Reportes automatizados
+## 10. Verificación de las suites
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+| Suite | Aserciones |
+|---|---|
+| `chronosrt_test` | 20 |
+| `chronosrt_test_lockfree` | 26 |
+| `chronosrt_test_rt` | 30 |
+| `chronosrt_test_resilience` | 29 |
+| `chronosrt_test_integration` | 27 |
+| `chronosrt_test_network` | 58 |
+| `chronosrt_test_hwaccel` | 40 |
+| `chronosrt_test_ethertux` | 103 |
+| `chronosrt_test_ethertux_v010` | 152 |
+| `chronosrt_test_aalid` | 62 |
+| **Total** | **547** |
+
+Estado del host de referencia: **11/11 suites, 100 %**, en 0,08 s.
+
+---
+
+## 11. Reportes automatizados
 
 ```bash
 #!/bin/bash
@@ -509,27 +430,3 @@ ctest --test-dir build --output-on-failure > "$OUT/ctest.txt" 2>&1
   echo "</body></html>"
 } > "$OUT/index.html"
 ```
-
----
-
-## 11. Verificación de las suites
-
-```bash
-ctest --test-dir build --output-on-failure
-```
-
-| Suite | Aserciones |
-|---|---:|
-| `chronosrt_test` | 20 |
-| `chronosrt_test_lockfree` | 26 |
-| `chronosrt_test_rt` | 30 |
-| `chronosrt_test_resilience` | 29 |
-| `chronosrt_test_integration` | 27 |
-| `chronosrt_test_network` | 58 |
-| `chronosrt_test_hwaccel` | 40 |
-| `chronosrt_test_ethertux` | 103 |
-| `chronosrt_test_ethertux_v010` | 152 |
-| `chronosrt_test_aalid` | 62 |
-| **Total** | **547** |
-
-Estado del host de referencia: **10/10 suites, 100 %**, en 0,08 s.

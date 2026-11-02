@@ -21,22 +21,46 @@
 # =============================================================================
 
 # Identificadores canónicos (orden de presentación en --list).
+# NOTA: bpi-m2-zero y rpi-zero-2w han sido ELIMINADOS intencionalmente.
+# Estas SBCs no tienen Ethernet nativo y dependen de bus USB, que es
+# NO determinista por naturaleza (latencias multitrama, jitter no acotado).
+# El documento docs/no/implementar_soporte_eth.md §3.1 y §3.3 prohíbe
+# explícitamente cualquier interfaz en bus USB para EtherCAT/EtherTux.
 sbc_ids() {
     printf '%s\n' \
-        rpi-zero-2w rpi3 rpi4 rpi5 cm4 cm5 \
+        rpi3 rpi4 rpi5 cm4 cm5 \
         opi-zero2 opi-zero3 opi-3-lts opi-4-lts opi-5 opi-5-plus \
         btt-cb1 btt-cb2 mks-pi mks-skipr rock-pi-4 radxa-rock-3 radxa-rock-5 \
-        bpi-m2-zero bpi-m4 bpi-m5 le-potat renegade sweet-potato \
+        bpi-m4 bpi-m5 le-potat renegade sweet-potato \
         jetson-nano jetson-orin x86-64 x86-64-rt
 }
 
 # Normaliza alias habituales (rpi4, raspberry-pi-4, raspberrypi4, ...).
+# NOTA: bpi-m2-zero y rpi-zero-2w son rechazados intencionalmente.
 _sbc_alias() {
     local id="${1,,}"
     id="${id// /-}"
     id="${id//_/-}"
+    
+    # Rechazo explícito de SBCs sin Ethernet nativo (bus USB)
     case "$id" in
-        rpi-zero-2w|rpi-zero-2-w|zero2w|rpi02w|raspberry-pi-zero-2-w) echo rpi-zero-2w ;;
+        bpi-m2-zero|banana-pi-m2-zero|m2zero|bpi-m2zero)
+            echo "ERROR: bpi-m2-zero (Banana Pi M2 Zero) NO SOPORTADA." >&2
+            echo "Esta SBC no tiene Ethernet nativo y usa bus USB para Ethernet," >&2
+            echo "lo cual es NO determinista (jitter no acotado)." >&2
+            echo "Referencia: docs/no/implementar_soporte_eth.md §3.1" >&2
+            return 1
+            ;;
+        rpi-zero-2w|rpi-zero-2-w|zero2w|rpi02w|raspberry-pi-zero-2-w)
+            echo "ERROR: rpi-zero-2w (Raspberry Pi Zero 2 W) NO SOPORTADA." >&2
+            echo "Esta SBC no tiene Ethernet nativo (solo WiFi/USB)," >&2
+            echo "lo cual es NO determinista para EtherCAT/EtherTux." >&2
+            echo "Referencia: docs/no/implementar_soporte_eth.md §3.1" >&2
+            return 1
+            ;;
+    esac
+    
+    case "$id" in
         rpi3|rpi-3|rpi3b|rpi3b+|raspberry-pi-3)                       echo rpi3 ;;
         rpi4|rpi-4|rpi4b|raspberry-pi-4)                              echo rpi4 ;;
         rpi5|rpi-5|rpi5b|raspberry-pi-5)                              echo rpi5 ;;
@@ -55,7 +79,6 @@ _sbc_alias() {
         rock-pi-4|rockpi4|rock-pi4)                                   echo rock-pi-4 ;;
         radxa-rock-3|rock-3|rock3|radxa3)                             echo radxa-rock-3 ;;
         radxa-rock-5|rock-5|rock5|rock5b|rock-5b|radxa5)             echo radxa-rock-5 ;;
-        bpi-m2-zero|banana-pi-m2-zero|m2zero|bpi-m2zero)              echo bpi-m2-zero ;;
         bpi-m4|banana-pi-m4)                                          echo bpi-m4 ;;
         bpi-m5|banana-pi-m5)                                          echo bpi-m5 ;;
         le-potat|lepotato|le-potato)                                  echo le-potat ;;
@@ -80,10 +103,6 @@ sbc_load() {
 
     case "$id" in
         # --- Raspberry Pi -----------------------------------------------------
-        rpi-zero-2w)
-            SBC_NAME="Raspberry Pi Zero 2 W"; SBC_SOC="BCM2710A1"; SBC_CPU="Cortex-A53"
-            SBC_ARCH=aarch64; SBC_CORES=4; SBC_CRC32=yes; SBC_CRYPTO="no"
-            SBC_PHC=no; SBC_BENCH="";;
         rpi3)
             SBC_NAME="Raspberry Pi 3 B/B+"; SBC_SOC="BCM2837/B0"; SBC_CPU="Cortex-A53"
             SBC_ARCH=aarch64; SBC_CORES=4; SBC_CRC32=yes; SBC_CRYPTO="no"
@@ -167,11 +186,6 @@ sbc_load() {
             SBC_PHC=no; SBC_BENCH="rock5b"
             SBC_NOTES="A76+A55; rk2_crypto aún en parcheo => solo software";;
         # --- Banana Pi / Amlogic / Libre Computer -----------------------------
-        bpi-m2-zero)
-            SBC_NAME="Banana Pi M2 Zero"; SBC_SOC="Allwinner H3/H2+"; SBC_CPU="Cortex-A7"
-            SBC_ARCH=armv7; SBC_CORES=4; SBC_CRC32=no; SBC_CRYPTO="sun8i-ce"
-            SBC_PHC=no; SBC_BENCH=""
-            SBC_NOTES="ÚNICA SBC sin CRC32 por instrucción: la HAL usa el fallback slice-by-8";;
         bpi-m4)
             SBC_NAME="Banana Pi M4"; SBC_SOC="Realtek RTD1395"; SBC_CPU="Cortex-A53"
             SBC_ARCH=aarch64; SBC_CORES=4; SBC_CRC32=yes; SBC_CRYPTO="desconocido"
@@ -291,7 +305,7 @@ sbc_detect() {
         *allwinner,sun50i-h618*)   id=opi-zero3 ;;
         *allwinner,sun50i-h616*)   id=opi-zero2 ;;
         *allwinner,sun50i-h6*)     id=opi-3-lts ;;
-        *allwinner,sun8i-h3*|*allwinner,sun8i-h2-plus*) id=bpi-m2-zero ;;
+        
         *rockchip,rk3588*)         id=radxa-rock-5 ;;
         *rockchip,rk3568*)         id=radxa-rock-3 ;;
         *rockchip,rk3566*)         id=btt-cb2 ;;
@@ -316,7 +330,7 @@ sbc_detect() {
                 fi
                 ;;
             aarch64|arm64) id="" ;;   # ARM64 genérico: sin perfil específico
-            armv7l|armv6l) id=bpi-m2-zero ;;
+            armv7l|armv6l) id="" ;;   # ARM32 genérico: sin perfil específico (no SBC soportadas con bus USB)
         esac
     fi
 

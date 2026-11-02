@@ -113,14 +113,15 @@ ChronosRT_status_t et_socket_open(et_port_t* port, const char* ifname) {
     int prio = 6;
     (void)setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio));
 
-#if defined(SO_TXTIME) && defined(SCM_TXTIME)
-    struct sock_txtime txtime;
-    memset(&txtime, 0, sizeof(txtime));
-    txtime.clockid = CLOCK_MONOTONIC;
-    txtime.flags = 0;
-    if (setsockopt(fd, SOL_SOCKET, SO_TXTIME, &txtime, sizeof(txtime)) == 0) {
-        port->txtime_enabled = true;
-    }
+    /* --- Recepción con timestamps de hardware/software --- */
+    /* Habilita PACKET_TIMESTAMP para capturar tiempos de llegada de tramas.
+     * SOF_TIMESTAMPING_RX_HARDWARE: timestamps provenientes del driver/NIC
+     * SOF_TIMESTAMPING_SOFTWARE: timestamps calculados por el kernel
+     * SOF_TIMESTAMPING_RAW_HARDWARE: timestamps sin procesar del hardware */
+#if defined(PACKET_TIMESTAMP)
+    int timestamping = SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_SOFTWARE |
+                      SOF_TIMESTAMPING_RAW_HARDWARE;
+    (void)setsockopt(fd, SOL_PACKET, PACKET_TIMESTAMP, &timestamping, sizeof(timestamping));
 #endif
 
     /*
@@ -135,6 +136,15 @@ ChronosRT_status_t et_socket_open(et_port_t* port, const char* ifname) {
 #ifdef SO_PREFER_BUSY_POLL
     int prefer = 1;
     (void)setsockopt(fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &prefer, sizeof(prefer));
+#endif
+#if defined(SO_TXTIME) && defined(SCM_TXTIME)
+    struct sock_txtime txtime;
+    memset(&txtime, 0, sizeof(txtime));
+    txtime.clockid = CLOCK_MONOTONIC;
+    txtime.flags = 0;
+    if (setsockopt(fd, SOL_SOCKET, SO_TXTIME, &txtime, sizeof(txtime)) == 0) {
+        port->txtime_enabled = true;
+    }
 #endif
     int rcvbuf = 1 << 20;
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
@@ -571,62 +581,74 @@ int et_socket_send_at(et_port_t* port, const uint8_t* frame, uint32_t len,
 }
 
 int et_socket_recv(et_port_t* port, uint8_t* frame, uint32_t bufsize,
-                   uint32_t timeout_us) {
+                   uint32_t timeout_us, uint64_t* out_rx_timestamp) {
     if (port == NULL || port->fd < 0 || frame == NULL || bufsize == 0u) {
         return -1;
+    }
+
+    if (out_rx_timestamp != NULL) {
+        *out_rx_timestamp = 0;
     }
 
     uint64_t deadline = et_now_us() + (uint64_t)timeout_us;
 
     for (;;) {
         /*
-         * Camino rápido: si ya hay una trama en el socket, un único `recv`
-         * (sin `poll`) evita la mitad de las llamadas al sistema por trama.
+         * Camino rápido: si ya hay una trama en el socket, un único `recvmsg`
+         * (con `PACKET_TIMESTAMP`) captura el timestamp junto con la trama.
          */
-        ssize_t n = recv(port->fd, frame, bufsize, MSG_DONTWAIT);
-        if (n >= (ssize_t)(ChronosRT_ET_ETH_HDR_SIZE + ChronosRT_ET_HEADER_SIZE)) {
-            uint16_t eth_type = (uint16_t)((frame[12] << 8) | frame[13]);
-            if (eth_type == ChronosRT_ET_ETHERTYPE) {
+        struct iovec iov;
+        iov.iov_base = frame;
+        iov.iov_len = bufsize;
+
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+
+        /* Buffer para los mensajes de control (timestamps) */
+        char cbuf[CMSG_SPACE(sizeof(struct timeval)) + CMSG_SPACE(sizeof(int))];
+        memset(&msg.msg_control, 0, sizeof(msg.msg_control));
+        msg.msg_controllen = sizeof(cbuf);
+
+        ssize_t n = recvmsg(port->fd, &msg, MSG_DONTWAIT);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                uint64_t now = et_now_us();
+                if (now >= deadline) {
+                    return -1;
+                }
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0) {
+            return 0;
+        }
+
+        /* Extraer timestamp si está disponible */
+        if (out_rx_timestamp != NULL) {
+            struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+            if (cmsg != NULL && cmsg->cmsg_level == SOL_SOCKET &&
+                cmsg->cmsg_type == SO_TIMESTAMP) {
+                struct timeval* ts = (struct timeval*)CMSG_DATA(cmsg);
+                if (ts != NULL) {
+                    *out_rx_timestamp = (uint64_t)ts->tv_sec * 1000000000ull +
+                                        (uint64_t)ts->tv_usec * 1000ull;
+                }
+            }
+        }
+
+        /* Verificar si la trama es EtherTux */
+        uint16_t eth_type = (uint16_t)((frame[12] << 8) | frame[13]);
+        if (eth_type == ChronosRT_ET_ETHERTYPE) {
+            if (n >= (ssize_t)(ChronosRT_ET_ETH_HDR_SIZE + ChronosRT_ET_HEADER_SIZE)) {
                 port->frames_rx++;
                 port->bytes_rx += (uint32_t)n;
                 return (int)n;
             }
             continue;   /* ajena: sigue drenando */
         }
-        if (n >= 0) {
-            continue;   /* trama corta: descártala y sigue */
-        }
-        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-            return -1;
-        }
-
-        uint64_t now = et_now_us();
-        if (now >= deadline) {
-            return -1;
-        }
-        uint64_t remaining_us = deadline - now;
-        int wait_ms = (int)((remaining_us + 999u) / 1000u);
-        if (wait_ms <= 0) {
-            wait_ms = 1;
-        }
-
-        struct pollfd pfd;
-        pfd.fd = port->fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-
-        int pr = poll(&pfd, 1, wait_ms);
-        if (pr < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -1;
-        }
-        if (pr == 0) {
-            continue;   /* reevalúa el deadline */
-        }
-        if ((pfd.revents & POLLIN) == 0) {
-            continue;
-        }
+        continue;   /* ajena: sigue drenando */
     }
 }

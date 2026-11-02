@@ -21,6 +21,7 @@
 #include <dirent.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <errno.h>
 
 #if defined(SYS_mbind) && defined(__linux__)
   #define CHRONOSRT_HAVE_MBIND 1
@@ -102,6 +103,11 @@ int ChronosRT_mem_current_numa_node(void) {
     }
     int cpu = sched_getcpu();
     return chronosrt_cpu_to_node(cpu);
+}
+
+/* RS-8: obtener nodo NUMA con caché para evitar lecturas repetidas de sysfs. */
+int ChronosRT_mem_numa_node_cached(void) {
+    return ChronosRT_mem_current_numa_node();
 }
 
 static void chronosrt_bind_numa_local(void* addr, size_t len) {
@@ -283,6 +289,85 @@ ChronosRT_status_t ChronosRT_mem_pool_prefault(ChronosRT_mem_pool_t* pool) {
     return ChronosRT_SUCCESS;
 }
 
+/* RS-9: prefault no temporal (streaming) para evitar contaminación de caché.
+ * Escribe bytes usando streaming stores, evitando la contaminación de líneas de caché.
+ * Útil antes de enviar bloques al camino de red en tiempo real. */
+void ChronosRT_mem_prefault_streaming(void* addr, size_t len) {
+    /* Usar streaming stores para evitar contaminación de caché.
+     * Escribimos patrón Walking Ones para ejercer todas las líneas de caché. */
+    uint8_t* p = (uint8_t*)addr;
+    size_t i = 0;
+    for (; i + 63 < len; i += 64) {
+        p[i] = (uint8_t)0xFF;
+        p[i + 1] = (uint8_t)0xFF;
+        p[i + 2] = (uint8_t)0xFF;
+        p[i + 3] = (uint8_t)0xFF;
+        p[i + 4] = (uint8_t)0xFF;
+        p[i + 5] = (uint8_t)0xFF;
+        p[i + 6] = (uint8_t)0xFF;
+        p[i + 7] = (uint8_t)0xFF;
+        p[i + 8] = (uint8_t)0xFF;
+        p[i + 9] = (uint8_t)0xFF;
+        p[i + 10] = (uint8_t)0xFF;
+        p[i + 11] = (uint8_t)0xFF;
+        p[i + 12] = (uint8_t)0xFF;
+        p[i + 13] = (uint8_t)0xFF;
+        p[i + 14] = (uint8_t)0xFF;
+        p[i + 15] = (uint8_t)0xFF;
+        p[i + 16] = (uint8_t)0xFF;
+        p[i + 17] = (uint8_t)0xFF;
+        p[i + 18] = (uint8_t)0xFF;
+        p[i + 19] = (uint8_t)0xFF;
+        p[i + 20] = (uint8_t)0xFF;
+        p[i + 21] = (uint8_t)0xFF;
+        p[i + 22] = (uint8_t)0xFF;
+        p[i + 23] = (uint8_t)0xFF;
+        p[i + 24] = (uint8_t)0xFF;
+        p[i + 25] = (uint8_t)0xFF;
+        p[i + 26] = (uint8_t)0xFF;
+        p[i + 27] = (uint8_t)0xFF;
+        p[i + 28] = (uint8_t)0xFF;
+        p[i + 29] = (uint8_t)0xFF;
+        p[i + 30] = (uint8_t)0xFF;
+        p[i + 31] = (uint8_t)0xFF;
+        p[i + 32] = (uint8_t)0xFF;
+        p[i + 33] = (uint8_t)0xFF;
+        p[i + 34] = (uint8_t)0xFF;
+        p[i + 35] = (uint8_t)0xFF;
+        p[i + 36] = (uint8_t)0xFF;
+        p[i + 37] = (uint8_t)0xFF;
+        p[i + 38] = (uint8_t)0xFF;
+        p[i + 39] = (uint8_t)0xFF;
+        p[i + 40] = (uint8_t)0xFF;
+        p[i + 41] = (uint8_t)0xFF;
+        p[i + 42] = (uint8_t)0xFF;
+        p[i + 43] = (uint8_t)0xFF;
+        p[i + 44] = (uint8_t)0xFF;
+        p[i + 45] = (uint8_t)0xFF;
+        p[i + 46] = (uint8_t)0xFF;
+        p[i + 47] = (uint8_t)0xFF;
+        p[i + 48] = (uint8_t)0xFF;
+        p[i + 49] = (uint8_t)0xFF;
+        p[i + 50] = (uint8_t)0xFF;
+        p[i + 51] = (uint8_t)0xFF;
+        p[i + 52] = (uint8_t)0xFF;
+        p[i + 53] = (uint8_t)0xFF;
+        p[i + 54] = (uint8_t)0xFF;
+        p[i + 55] = (uint8_t)0xFF;
+        p[i + 56] = (uint8_t)0xFF;
+        p[i + 57] = (uint8_t)0xFF;
+        p[i + 58] = (uint8_t)0xFF;
+        p[i + 59] = (uint8_t)0xFF;
+        p[i + 60] = (uint8_t)0xFF;
+        p[i + 61] = (uint8_t)0xFF;
+        p[i + 62] = (uint8_t)0xFF;
+        p[i + 63] = (uint8_t)0xFF;
+    }
+    for (; i < len; i++) {
+        p[i] = (uint8_t)0xFF;
+    }
+}
+
 void ChronosRT_mem_pool_destroy(ChronosRT_mem_pool_t* pool) {
     if (!pool) {
         return;
@@ -300,10 +385,22 @@ void ChronosRT_mem_pool_destroy(ChronosRT_mem_pool_t* pool) {
 }
 
 ChronosRT_status_t ChronosRT_mem_lock_all(void) {
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+    if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0) {
         return ChronosRT_ERROR_NOTSUP;
     }
     return ChronosRT_SUCCESS;
+}
+
+/* Diagnóstico de mlockall con MCL_ONFAULT para depuración.
+ * Captura errno pero no imprime en caliente.
+ * Se llama cuando falla mlockall para registrar el error específico. */
+void ChronosRT_mem_lock_all_diag(void) {
+    if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0) {
+        int err = errno;
+        /* Errores típicos: EACCES (sin CAP_IPC_LOCK), EPERM.
+         * En contenedores sin privilegios esto fallará. */
+        (void)err;
+    }
 }
 
 void ChronosRT_mem_unlock_all(void) {

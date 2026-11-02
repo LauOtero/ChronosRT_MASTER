@@ -15,6 +15,7 @@ typedef struct {
     bool     isolcpus;          /* token isolcpus= en /proc/cmdline */
     bool     nohz_full;         /* token nohz_full= en /proc/cmdline */
     bool     rcu_nocbs;         /* token rcu_nocbs= en /proc/cmdline */
+    bool     cmdline_cached;    /* cacheado de detección isolcpus= */
     bool     eevdf;             /* >= 6.6 (planificador EEVDF por defecto) */
     bool     sched_ext;         /* >= 6.12 (sched_ext / BPF schedulers) */
     bool     io_uring;          /* >= 5.1 */

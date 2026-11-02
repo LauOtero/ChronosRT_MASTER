@@ -440,21 +440,19 @@ static uint32_t crc_be_hw(uint32_t s, const void* d, size_t n) {
 }
 #endif
 
+/* Tabla unificada de backends de CRC-32C.
+ * Incluye el backend de software slice-by-8 (siempre disponible).
+ * Los backends de hardware (sse4.2-x4 o armv8-crc) se marcan disponibles
+ * según la detección de ISA en caps_init(). */
+static crc_backend_entry_t s_crc_backends[] = {
 #if CRT_X86
-static crc_backend_entry_t s_crc_backends[] = {
     { "sse4.2-x4",    crc_be_hw,              false },
-    { "slice-by-8",   ChronosRT_crc32c_sw_raw, true },
-};
-#elif CRT_ARM64
-static crc_backend_entry_t s_crc_backends[] = {
-    { "armv8-crc",    crc_be_hw,              false },
-    { "slice-by-8",   ChronosRT_crc32c_sw_raw, true },
-};
-#else
-static crc_backend_entry_t s_crc_backends[] = {
-    { "slice-by-8",  ChronosRT_crc32c_sw_raw, true },
-};
 #endif
+    { "slice-by-8",   ChronosRT_crc32c_sw_raw, true },
+#if CRT_ARM64
+    { "armv8-crc",    crc_be_hw,              false },
+#endif
+};
 
 #define CRC_BACKEND_COUNT (sizeof(s_crc_backends) / sizeof(s_crc_backends[0]))
 
